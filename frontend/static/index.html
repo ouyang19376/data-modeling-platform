@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>数据建模中心 · Data Modeling Center</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234f8cff'/%3E%3Ctext x='16' y='23' font-size='19' font-weight='bold' text-anchor='middle' fill='white' font-family='sans-serif'%3E数%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">数</div>
+        <div class="brand-text">
+          <div class="brand-title">数据建模中心</div>
+          <div class="brand-sub">Data Modeling Center · MVP</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item" data-view="dashboard">
+          <span class="nav-icon">▤</span>工作台
+        </button>
+        <button class="nav-item" data-view="requirements">
+          <span class="nav-icon">◈</span>业务需求
+        </button>
+        <button class="nav-item" data-view="models">
+          <span class="nav-icon">▦</span>模型中心
+        </button>
+        <button class="nav-item" data-view="graph">
+          <span class="nav-icon">◭</span>模型关系图
+        </button>
+        <button class="nav-item" data-view="events">
+          <span class="nav-icon">◷</span>运行事件
+        </button>
+        <button class="nav-item" data-view="users">
+          <span class="nav-icon">◍</span>用户与权限
+        </button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="sidebar-footer-title">当前项目</div>
+        <select id="project-select" class="select"></select>
+        <button id="btn-new-project" class="btn btn-ghost btn-block">+ 新建项目</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-title" id="view-title">工作台</div>
+        <div class="topbar-meta" id="view-meta"></div>
+        <div class="topbar-identity" id="identity-chip"></div>
+      </header>
+      <div class="content" id="content"></div>
+    </main>
+  </div>
+
+  <div class="toast-container" id="toast-container"></div>
+  <div class="modal-mask" id="modal-mask" hidden>
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <div class="modal-title" id="modal-title"></div>
+        <button class="modal-close" id="modal-close" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-footer" id="modal-footer"></div>
+    </div>
+  </div>
+
+  <script src="/vendor/neovis.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

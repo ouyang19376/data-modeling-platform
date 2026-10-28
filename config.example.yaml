@@ -1,0 +1,81 @@
+# 数据建模中心 — 应用配置模板
+#
+# 用法：复制本文件为 config.yaml（放在仓库根目录，即与 backend/ 同级），
+#       按需修改后启动服务；config.yaml 已列入 .gitignore，不会随版本库分发。
+#
+# 取值优先级：环境变量 > config.yaml > 内置默认值
+#   - 环境变量适合容器 / CI / 临时覆盖（变量名见各键注释）；
+#   - config.yaml 适合本地开发与服务器部署。
+#
+# 未知配置键会在启动时直接报错（fail-fast），允许的键以本文件为准。
+
+# 运行环境：local / dev / development / test 之一。
+# production / staging / prod 仅在 auth_mode=api_key 时允许启动
+# （demo 演示身份禁止暴露于生产环境）。
+# 对应环境变量：APP_ENV
+app_env: local
+
+# 数据库连接串（SQLAlchemy 风格）。
+#   默认 SQLite 文件库（相对路径基于进程工作目录，建议从仓库根目录启动）；
+#   生产建议 PostgreSQL：postgresql+psycopg://user:pass@host:5432/dmc
+# 对应环境变量：DATABASE_URL
+database_url: sqlite:///./data/platform.db
+
+# 启动时自动执行 Alembic 迁移（alembic upgrade head）。
+# 对应环境变量：AUTO_MIGRATE
+auto_migrate: true
+
+# 是否注入最小演示数据（PRJ_RETAIL：项目/主题域/需求/已发布模型 dwd_contract
+# 与草稿 dim_customer）。仅在数据库为空时播种，不会重复注入；
+# 需要更大规模的电商数仓演示集（114 模型）时改为 false，并按 README
+# 「电商数仓演示数据集」一节运行 scripts/seed_ecommerce_demo.py。
+# 对应环境变量：SEED_DEMO_DATA
+seed_demo_data: true
+
+# 是否允许 X-Actor 请求头指定演示身份（仅 demo 模式 + 本地开发用途；
+# 生产环境必须关闭）。
+# 对应环境变量：ALLOW_DEMO_ACTOR_HEADER
+allow_demo_actor_header: true
+
+# 一次性接管未版本化的既有数据库 schema（默认关闭；开启后启动时自动
+# stamp baseline，仅用于从无迁移历史的老库升级）。
+# 对应环境变量：ADOPT_LEGACY_SCHEMA
+adopt_legacy_schema: false
+
+# 日志级别：DEBUG / INFO / WARNING / ERROR。
+# 对应环境变量：LOG_LEVEL
+log_level: INFO
+
+# 数据目录（SQLite 相对路径基于进程工作目录；一般保持默认即可）。
+# 对应环境变量：DATA_DIR
+data_dir: ./data
+
+# ---- 认证与授权（V1.0 / V1.2） ----
+
+# demo：X-Actor 演示身份，授权检查短路（仅本地演示，行为同 V0.9.2）。
+# api_key：Authorization: Bearer dmc_<key_id>_<secret>；服务端只存
+#           SHA-256(secret) 摘要，secret 仅在创建响应返回一次。
+# 对应环境变量：AUTH_MODE
+auth_mode: demo
+
+# api_key 模式首次引导令牌（POST /api/auth/bootstrap 使用；为空时禁止引导）。
+# 生产部署必须设置为高强度随机值，并视为机密信息——config.yaml 不进版本库，
+# 但切勿提交到任何公开位置。
+# 对应环境变量：BOOTSTRAP_TOKEN
+bootstrap_token: ""
+
+# full_snapshot 血缘导入的「计划停用比例」阈值（0~1）：计划停用数占当前
+# active 边总数的比例超过该值、且未显式 confirm_deactivation=true 时，
+# 导入被拒绝（422 LINEAGE_DEACTIVATION_CONFIRM_REQUIRED）。
+# 对应环境变量：FULL_SNAPSHOT_DEACTIVATE_RATIO_THRESHOLD
+full_snapshot_deactivate_ratio_threshold: 0.5
+
+# dbt manifest 连接器规模上限：序列化后字节数与推导边数，超出返回 422。
+# 对应环境变量：DBT_MANIFEST_MAX_BYTES / DBT_MANIFEST_MAX_EDGES
+dbt_manifest_max_bytes: 8388608
+dbt_manifest_max_edges: 1000
+
+# API Key 认证缓存 TTL（秒）。吊销 / 禁用为即时失效（主动 invalidate），
+# 不依赖 TTL；TTL 仅影响正常密钥的解析刷新频率。
+# 对应环境变量：AUTH_CACHE_TTL_SECONDS
+auth_cache_ttl_seconds: 60

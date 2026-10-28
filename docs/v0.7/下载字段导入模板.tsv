@@ -1,0 +1,2 @@
+field_code	field_name	logical_type	length	precision	scale	is_primary_key	is_unique	nullable	default_value	description	source_table	source_field	sensitivity
+customer_id	客户编号	BIGINT				true	false	false		客户唯一标识	ods_customer	customer_id	internal

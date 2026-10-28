@@ -1,0 +1,59 @@
+"""Add table-level constraint/index metadata for V0.8.
+
+Revision ID: 4a8fc21d0e63
+Revises: 1b30fa87c419
+"""
+from typing import Sequence, Union
+from alembic import op
+import sqlalchemy as sa
+
+revision: str = "4a8fc21d0e63"
+down_revision: Union[str, None] = "1b30fa87c419"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "model_constraints",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("model_id", sa.Integer(), nullable=False),
+        sa.Column("constraint_name", sa.String(length=128), nullable=False),
+        sa.Column("constraint_type", sa.String(length=24), nullable=False),
+        sa.Column("field_codes_json", sa.Text(), nullable=False),
+        sa.Column("expression", sa.Text(), nullable=False),
+        sa.Column("referenced_model_id", sa.Integer(), nullable=True),
+        sa.Column("referenced_field_codes_json", sa.Text(), nullable=False),
+        sa.Column("on_delete", sa.String(length=24), nullable=False),
+        sa.Column("description", sa.Text(), nullable=False),
+        sa.Column("created_by", sa.String(length=80), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["model_id"], ["data_models.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["referenced_model_id"], ["data_models.id"], ondelete="RESTRICT"),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("model_id", "constraint_name", name="uq_model_constraint_name"),
+    )
+    op.create_index("ix_model_constraint_type", "model_constraints", ["model_id", "constraint_type"], unique=False)
+    op.create_table(
+        "model_indexes",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("model_id", sa.Integer(), nullable=False),
+        sa.Column("index_name", sa.String(length=128), nullable=False),
+        sa.Column("index_type", sa.String(length=16), nullable=False),
+        sa.Column("field_codes_json", sa.Text(), nullable=False),
+        sa.Column("is_unique", sa.Boolean(), nullable=False),
+        sa.Column("description", sa.Text(), nullable=False),
+        sa.Column("created_by", sa.String(length=80), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["model_id"], ["data_models.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("model_id", "index_name", name="uq_model_index_name"),
+    )
+    op.create_index("ix_model_index_model", "model_indexes", ["model_id"], unique=False)
+
+
+def downgrade() -> None:
+    op.drop_index("ix_model_index_model", table_name="model_indexes")
+    op.drop_table("model_indexes")
+    op.drop_index("ix_model_constraint_type", table_name="model_constraints")
+    op.drop_table("model_constraints")

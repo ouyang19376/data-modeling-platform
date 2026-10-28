@@ -1,0 +1,60 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- 测试与工具缓存 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- 本地配置（模板为 config.example.yaml，不纳入版本库） ----
+config.yaml
+config.local.yaml
+
+# ---- 数据与备份库（演示库按需本地生成，不进版本库） ----
+data/*.db
+data/*.db*
+backend/data/
+
+# ---- 构建产物 ----
+*.zip
+
+# ---- 浏览器 E2E / 开发机残留 ----
+.playwright-cli/
+.playwright-cli-e2e/
+s1.yaml
+s2.yaml
+dashboard.png
+models.png
+screenshot_v09_lineage.png
+
+# ---- IDE / 操作系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- 日志 ----
+*.log
+
+# ---- 文档提取中间产物（docx 转文本的工作残留，可随时重新生成） ----
+_extracted*
+**/_extracted*
+
+# ---- WorkBuddy 项目数据 ----
+.workbuddy/
