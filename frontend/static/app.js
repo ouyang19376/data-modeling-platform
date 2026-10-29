@@ -209,6 +209,7 @@ const state = {
   usersFilter: { q: "", status: "" },
   members: [],               // 当前项目成员（owner/admin 管理）
   keys: [],                  // API Key 列表（本人或 admin 代查）
+  busMatrix: null,           // 业务总线矩阵：{mode:"overview"|"area", data}
 };
 
 // 调试 / E2E 钩子：暴露全局状态与图谱实例（只读用途）
@@ -501,6 +502,298 @@ function svgStackedBar(items, svgId) {
     ${legend}</div>`;
 }
 
+// ---------------------------------------------------------------- 业务总线矩阵（V1.3）
+// Kimball 总线矩阵：行 = 业务过程（DWD/DWS 模型），列 = 维度（DIM 模型），
+// 单元格 = 过程与维度的直连关系。默认展示企业级总览（主题域 × 维度热力图 +
+// 一致性维度榜），点击主题域下钻域内矩阵（过程 × 维度 + 字段映射明细 +
+// 本域/外域维度复用对比）。
+
+const BM_REL_COLORS = {
+  joins_to: "#4f8cff", derived_from: "#35c98d", depends_on: "#f0a63c", references: "#8d99b5",
+};
+const BM_HEAT_STEPS = 4;
+
+function bmShortDimName(name) {
+  const short = String(name || "").replace(/维表$/, "");
+  return short.length > 4 ? short.slice(0, 4) : short;
+}
+
+async function renderBusMatrixCard() {
+  const box = $("#bus-matrix");
+  if (!box) return;
+  box.innerHTML = `<div class="empty chart-empty"><div class="empty-icon">◌</div><div class="empty-desc">总线矩阵推导中…</div></div>`;
+  try {
+    const d = await api(`/api/projects/${state.projectId}/bus-matrix`);
+    state.busMatrix = { mode: "overview", data: d };
+    renderBusMatrix();
+  } catch (e) {
+    box.innerHTML = `<div class="empty chart-empty"><div class="empty-icon">⚠</div><div class="empty-desc">总线矩阵加载失败：${escapeHtml(e.message || "未知错误")}</div></div>`;
+  }
+}
+
+async function busMatrixDrill(areaId) {
+  const box = $("#bus-matrix");
+  if (!box) return;
+  box.innerHTML = `<div class="empty chart-empty"><div class="empty-icon">◌</div><div class="empty-desc">推导域内矩阵…</div></div>`;
+  try {
+    const d = await api(`/api/projects/${state.projectId}/bus-matrix?subject_area_id=${areaId}`);
+    state.busMatrix = { mode: "area", data: d };
+    renderBusMatrix();
+  } catch (e) {
+    showError(e);
+    await renderBusMatrixCard();
+  }
+}
+
+function renderBusMatrix() {
+  const box = $("#bus-matrix");
+  const bm = state.busMatrix;
+  if (!box || !bm) return;
+  if (bm.mode === "area") {
+    box.innerHTML = busMatrixAreaHtml(bm.data);
+    wireBusMatrixArea();
+  } else {
+    box.innerHTML = busMatrixOverviewHtml(bm.data);
+    wireBusMatrixOverview();
+  }
+}
+
+// ---- 企业级总览 ----
+
+function busMatrixOverviewHtml(d) {
+  const s = d.summary;
+  const alertCount = s.orphan_dimensions.length + s.unmapped_processes.length;
+  return `
+    <div class="grid grid-4">
+      <div class="stat-card"><div class="stat-label">业务过程（DWD/DWS）</div><div class="stat-value accent">${s.process_total}</div><div class="stat-foot">分布于 ${s.subject_area_total} 个主题域</div></div>
+      <div class="stat-card"><div class="stat-label">一致性维度</div><div class="stat-value success">${s.shared_dimensions.length}</div><div class="stat-foot">跨域复用 · 维度共 ${s.dimension_total} 个</div></div>
+      <div class="stat-card"><div class="stat-label">过程 → 维度直连</div><div class="stat-value warning">${s.relation_total}</div><div class="stat-foot">${s.mapped_cells} 个映射单元格</div></div>
+      <div class="stat-card"><div class="stat-label">治理提示</div><div class="stat-value" style="color:${alertCount ? "var(--danger)" : "var(--success)"}">${alertCount}</div><div class="stat-foot">孤岛维度 ${s.orphan_dimensions.length} · 未挂载过程 ${s.unmapped_processes.length}</div></div>
+    </div>
+    <div class="mt20">${busMatrixHeatmapHtml(d)}</div>
+    <div class="grid grid-2 mt20">
+      <div class="card chart-card">
+        <div class="card-title">维度复用度 <span class="sub">引用过程数 · 跨域复用即一致性维度</span></div>
+        ${d.dimensions.length ? busMatrixReuseOverviewSvg(d) : chartEmpty("项目内暂无 DIM 维度模型")}
+      </div>
+      <div class="card">
+        <div class="card-title">一致性维度榜 <span class="sub">总线契约的核心资产</span></div>
+        ${s.shared_dimensions.length ? `<div class="table-wrap"><table class="data">
+          <thead><tr><th>维度</th><th class="num">覆盖主题域</th><th class="num">引用过程</th></tr></thead>
+          <tbody>${s.shared_dimensions.map((x) => `<tr>
+            <td><span class="mono">${escapeHtml(x.model_key)}</span><div class="small muted">${escapeHtml(x.name)}</div></td>
+            <td class="num">${x.area_count}</td><td class="num">${x.process_count}</td></tr>`).join("")}
+          </tbody></table></div>` : `<div class="empty"><div class="empty-icon">◇</div><div class="empty-title">暂无一致性维度</div><div class="empty-desc">各主题域尚未形成跨域复用的维度契约。</div></div>`}
+      </div>
+    </div>
+    <div class="bm-notes mt20">${busMatrixOverviewNotes(d)}</div>`;
+}
+
+function busMatrixHeatmapHtml(d) {
+  if (!d.dimensions.length)
+    return `<div class="empty"><div class="empty-icon">▦</div><div class="empty-title">暂无维度模型</div><div class="empty-desc">总线矩阵需要项目内存在 DIM 层维度模型作为列。</div></div>`;
+  if (!d.matrix.length)
+    return `<div class="empty"><div class="empty-desc">暂无主题域与业务过程。</div></div>`;
+  const max = Math.max(1, ...d.matrix.flatMap((r) => r.counts));
+  const head = `<tr><th class="bm-corner">主题域 / 维度</th>${d.dimensions.map((dim) =>
+    `<th class="bm-dim-col" title="${escapeHtml(dim.model_key)} · ${escapeHtml(dim.name)}">${escapeHtml(bmShortDimName(dim.name))}</th>`).join("")}</tr>`;
+  const rows = d.matrix.map((row) => {
+    const label = row.unassigned
+      ? `<span class="muted">未归属过程</span><div class="small muted mono">${row.process_count} 个过程</div>`
+      : `<div style="font-weight:600">${escapeHtml(row.subject_area.name)}</div>
+         <div class="small muted mono">${escapeHtml(row.subject_area.area_key)} · ${row.process_count} 个过程</div>`;
+    const cells = row.counts.map((c, ci) => {
+      if (!c) return `<td class="bm-cell bm-cell-0"></td>`;
+      const level = Math.max(1, Math.min(BM_HEAT_STEPS, Math.ceil((c / max) * BM_HEAT_STEPS)));
+      const areaName = row.unassigned ? "未归属" : row.subject_area.name;
+      return `<td class="bm-cell bm-cell-${level}" title="${escapeHtml(areaName)} × ${escapeHtml(d.dimensions[ci].name)}：${c} 个过程引用${row.unassigned ? "" : "，点击下钻域内矩阵"}">${c}</td>`;
+    }).join("");
+    return row.unassigned
+      ? `<tr><td class="bm-area-cell">${label}</td>${cells}</tr>`
+      : `<tr class="bm-area-row" data-bm-area="${row.subject_area.id}"><td class="bm-area-cell">${label}</td>${cells}</tr>`;
+  }).join("");
+  return `<div class="table-wrap"><table class="data bm-heat"><thead>${head}</thead><tbody>${rows}</tbody></table></div>
+    <div class="bm-heat-legend small muted">色深 = 该主题域引用该维度的过程数 · 点击行下钻域内矩阵</div>`;
+}
+
+function busMatrixReuseOverviewSvg(d) {
+  const rows = d.dimensions.map((dim, ci) => {
+    let count = 0, areas = 0;
+    for (const r of d.matrix) { count += r.counts[ci]; if (r.counts[ci] > 0) areas += 1; }
+    return { name: dim.name, model_key: dim.model_key, count, areas };
+  }).filter((r) => r.count > 0)
+    .sort((a, b) => b.count - a.count || b.areas - a.areas || a.model_key.localeCompare(b.model_key));
+  if (!rows.length) return chartEmpty("暂无过程 → 维度直连关系");
+  const rowH = 30, labelW = 92, trackW = 240, valW = 64, padTop = 6;
+  const W = labelW + trackW + valW + 12;
+  const H = rows.length * rowH + padTop * 2;
+  const max = Math.max(...rows.map((r) => r.count), 1);
+  const bars = rows.map((it, i) => {
+    const y = padTop + i * rowH;
+    const w = Math.max(4, (trackW * it.count) / max);
+    const color = it.areas >= 2 ? "#4f8cff" : "#58b6e8";
+    const short = it.name.length > 6 ? it.name.slice(0, 6) + "…" : it.name;
+    return `<g>
+      <title>${escapeHtml(it.name)}（${escapeHtml(it.model_key)}）：${it.count} 个过程引用 · 覆盖 ${it.areas} 个主题域</title>
+      <text x="0" y="${y + rowH / 2 + 4}" class="chart-label">${escapeHtml(short)}</text>
+      <rect x="${labelW}" y="${y + (rowH - 14) / 2}" width="${trackW}" height="14" rx="7" class="chart-track" />
+      <rect x="${labelW}" y="${y + (rowH - 14) / 2}" width="${w.toFixed(1)}" height="14" rx="7" fill="${color}" class="chart-bar-anim" style="animation-delay:${(i * 60).toFixed(0)}ms" />
+      <text x="${labelW + trackW + 8}" y="${y + rowH / 2 + 4}" class="chart-value">${it.count} · ${it.areas} 域</text>
+    </g>`;
+  }).join("");
+  return `<svg class="chart-svg" viewBox="0 0 ${W} ${H}" role="img" preserveAspectRatio="xMinYMin meet" aria-label="维度复用度条形图">${bars}</svg>
+    <div class="chart-legend">
+      <div class="chart-legend-row"><span class="chart-legend-dot" style="background:#4f8cff"></span><span>一致性维度（≥2 域复用）</span></div>
+      <div class="chart-legend-row"><span class="chart-legend-dot" style="background:#58b6e8"></span><span>单域维度</span></div>
+    </div>`;
+}
+
+function busMatrixOverviewNotes(d) {
+  const s = d.summary;
+  const notes = [];
+  if (s.orphan_dimensions.length)
+    notes.push(`<div class="bm-note bm-note-danger">孤岛维度（无任何业务过程引用）：${s.orphan_dimensions.map((x) => `<span class="mono">${escapeHtml(x.model_key)}</span>`).join("、")}</div>`);
+  if (s.unmapped_processes.length)
+    notes.push(`<div class="bm-note bm-note-warning">未挂载任何维度的过程（${s.unmapped_processes.length} 个）：${s.unmapped_processes.map((x) => `<span class="mono">${escapeHtml(x.model_key)}</span>`).join("、")}</div>`);
+  if (!notes.length)
+    notes.push(`<div class="bm-note bm-note-ok">全部业务过程均已显式挂载维度，总线契约完整。</div>`);
+  return notes.join("");
+}
+
+// ---- 域内明细 ----
+
+function busMatrixAreaHtml(d) {
+  const s = d.summary;
+  return `
+    <div class="flex flex-wrap" style="align-items:center;gap:10px">
+      <button class="btn btn-sm" id="bm-back">← 返回企业总览</button>
+      <span style="font-weight:650;font-size:15px">${escapeHtml(d.subject_area.name)}</span>
+      <span class="mono small muted">${escapeHtml(d.subject_area.area_key)}</span>
+      ${d.subject_area.owner ? `<span class="badge badge-neutral">${escapeHtml(d.subject_area.owner)}</span>` : ""}
+      <span class="small muted">· 域内总线矩阵</span>
+    </div>
+    <div class="grid grid-4 mt14">
+      <div class="stat-card"><div class="stat-label">域内业务过程</div><div class="stat-value accent">${s.process_total}</div><div class="stat-foot">DWD / DWS 模型</div></div>
+      <div class="stat-card"><div class="stat-label">映射单元格</div><div class="stat-value success">${s.mapped_cells}</div><div class="stat-foot">${s.relation_total} 条直连关系</div></div>
+      <div class="stat-card"><div class="stat-label">跨域引用</div><div class="stat-value warning">${s.cross_area_relations}</div><div class="stat-foot">引用外域维度的关系数</div></div>
+      <div class="stat-card"><div class="stat-label">未挂载过程</div><div class="stat-value" style="color:${s.unmapped_processes.length ? "var(--danger)" : "var(--success)"}">${s.unmapped_processes.length}</div><div class="stat-foot">${s.unmapped_processes.length ? "见下方提示" : "域内过程全部挂载维度"}</div></div>
+    </div>
+    <div class="mt20">${busMatrixAreaTableHtml(d)}</div>
+    <div class="grid grid-2 mt20">
+      <div class="card chart-card">
+        <div class="card-title">维度复用对比 <span class="sub">本域过程 vs 外域过程</span></div>
+        ${d.dimension_reuse.some((r) => r.total_process_count > 0) ? busMatrixReuseAreaSvg(d) : chartEmpty("该域暂无维度直连关系")}
+      </div>
+      <div class="card">
+        <div class="card-title">字段映射明细 <span class="sub">点击矩阵单元格查看</span></div>
+        <div id="bm-detail"><div class="empty"><div class="empty-desc">选择左侧矩阵中的一个映射单元格。</div></div></div>
+      </div>
+    </div>
+    ${s.unmapped_processes.length ? `<div class="bm-notes mt20"><div class="bm-note bm-note-warning">未挂载维度的过程：${s.unmapped_processes.map((x) => `<span class="mono">${escapeHtml(x.model_key)}</span>（${escapeHtml(x.name)}）`).join("、")}</div></div>` : ""}`;
+}
+
+function busMatrixAreaTableHtml(d) {
+  if (!d.processes.length)
+    return `<div class="empty"><div class="empty-icon">▦</div><div class="empty-title">域内暂无业务过程</div><div class="empty-desc">该主题域下没有 DWD / DWS 模型。</div></div>`;
+  if (!d.dimensions.length)
+    return `<div class="empty"><div class="empty-icon">▦</div><div class="empty-title">项目内暂无维度</div><div class="empty-desc">总线矩阵需要 DIM 层维度模型作为列。</div></div>`;
+  const cellByKey = {};
+  for (const c of d.cells) cellByKey[`${c.process_id}:${c.dimension_id}`] = c;
+  const head = `<tr><th class="bm-corner">业务过程 / 维度</th>${d.dimensions.map((dim) =>
+    `<th class="bm-dim-col" title="${escapeHtml(dim.model_key)} · ${escapeHtml(dim.name)}">${escapeHtml(bmShortDimName(dim.name))}</th>`).join("")}</tr>`;
+  const rows = d.processes.map((p) => {
+    const cells = d.dimensions.map((dim) => {
+      const c = cellByKey[`${p.id}:${dim.id}`];
+      if (!c) return `<td class="bm-cell bm-cell-0"></td>`;
+      const relType = c.relationship_types.find((t) => BM_REL_COLORS[t]) || c.relationship_types[0];
+      const color = BM_REL_COLORS[relType] || "#8d99b5";
+      const relLabel = c.relationship_types.map((t) => REL_TYPE_LABEL[t] || t).join(" / ");
+      return `<td class="bm-cell bm-cell-filled" data-bm-cell="${p.id}:${dim.id}" style="--bm-cell-color:${color}"
+        title="${escapeHtml(p.name)} → ${escapeHtml(dim.name)}：${escapeHtml(relLabel)}，点击查看字段映射">${c.edge_count}</td>`;
+    }).join("");
+    return `<tr>
+      <td class="bm-area-cell">
+        <div style="font-weight:600">${escapeHtml(p.name)}</div>
+        <div class="small muted mono">${escapeHtml(p.model_key)}</div>
+        <div class="small muted"><span class="badge badge-neutral">${escapeHtml(p.layer)}</span> 覆盖 ${p.dimension_count} 维</div>
+      </td>${cells}</tr>`;
+  }).join("");
+  return `<div class="table-wrap"><table class="data bm-heat bm-area-matrix"><thead>${head}</thead><tbody>${rows}</tbody></table></div>
+    <div class="bm-heat-legend small muted">数字 = 直连关系数 · 颜色 = 关系类型（${REL_TYPES.map((t) => REL_TYPE_LABEL[t]).join(" / ")}）· 点击单元格查看字段映射</div>`;
+}
+
+function busMatrixReuseAreaSvg(d) {
+  const rows = d.dimension_reuse
+    .filter((r) => r.total_process_count > 0)
+    .map((r) => ({ name: r.name, model_key: r.model_key, inArea: r.in_area_process_count, outArea: r.out_of_area_process_count, total: r.total_process_count, shared: r.is_shared }))
+    .sort((a, b) => b.total - a.total || a.model_key.localeCompare(b.model_key));
+  const rowH = 30, labelW = 92, trackW = 210, valW = 52, padTop = 6;
+  const W = labelW + trackW + valW + 12;
+  const H = rows.length * rowH + padTop * 2;
+  const max = Math.max(...rows.map((r) => r.total), 1);
+  const bars = rows.map((it, i) => {
+    const y = padTop + i * rowH;
+    const wIn = (trackW * it.inArea) / max;
+    const wOut = (trackW * it.outArea) / max;
+    const short = it.name.length > 6 ? it.name.slice(0, 6) + "…" : it.name;
+    return `<g>
+      <title>${escapeHtml(it.name)}（${escapeHtml(it.model_key)}）：本域 ${it.inArea} 个过程 · 外域 ${it.outArea} 个过程${it.shared ? " · 一致性维度" : ""}</title>
+      <text x="0" y="${y + rowH / 2 + 4}" class="chart-label">${escapeHtml(short)}</text>
+      <rect x="${labelW}" y="${y + (rowH - 14) / 2}" width="${trackW}" height="14" rx="7" class="chart-track" />
+      ${it.inArea ? `<rect x="${labelW}" y="${y + (rowH - 14) / 2}" width="${Math.max(3, wIn).toFixed(1)}" height="14" rx="7" fill="#4f8cff" class="chart-bar-anim" style="animation-delay:${(i * 60).toFixed(0)}ms" />` : ""}
+      ${it.outArea ? `<rect x="${(labelW + wIn).toFixed(1)}" y="${y + (rowH - 14) / 2}" width="${Math.max(3, wOut - 2).toFixed(1)}" height="14" rx="7" fill="#58b6e8" class="chart-bar-anim" style="animation-delay:${(i * 60 + 30).toFixed(0)}ms" />` : ""}
+      <text x="${labelW + trackW + 8}" y="${y + rowH / 2 + 4}" class="chart-value">${it.total}${it.shared ? " ★" : ""}</text>
+    </g>`;
+  }).join("");
+  return `<svg class="chart-svg" viewBox="0 0 ${W} ${H}" role="img" preserveAspectRatio="xMinYMin meet" aria-label="维度复用对比条形图">${bars}</svg>
+    <div class="chart-legend">
+      <div class="chart-legend-row"><span class="chart-legend-dot" style="background:#4f8cff"></span><span>本域过程引用</span></div>
+      <div class="chart-legend-row"><span class="chart-legend-dot" style="background:#58b6e8"></span><span>外域过程引用（★ = 一致性维度）</span></div>
+    </div>`;
+}
+
+function busMatrixDetailHtml(d, cell) {
+  const p = d.processes.find((x) => x.id === cell.process_id);
+  const dim = d.dimensions.find((x) => x.id === cell.dimension_id);
+  if (!p || !dim) return "";
+  return `
+    <div style="font-weight:650">${escapeHtml(p.name)} <span class="muted">→</span> ${escapeHtml(dim.name)}</div>
+    <div class="small muted mono">${escapeHtml(p.model_key)} × ${escapeHtml(dim.model_key)}</div>
+    <div class="mt14">${cell.field_pairs.map((e) => `
+      <div class="bm-edge">
+        <div class="flex" style="gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="badge" style="background:${BM_REL_COLORS[e.relationship_type] || "var(--panel-3)"};color:#fff">${escapeHtml(REL_TYPE_LABEL[e.relationship_type] || e.relationship_type)}</span>
+          <span class="badge badge-neutral">${escapeHtml(CARDINALITY_LABEL[e.cardinality] || e.cardinality)}</span>
+          <span class="small muted">${e.direction === "process_to_dimension" ? "过程 → 维度" : "维度 → 过程"}</span>
+        </div>
+        <div class="bm-edge-fields mono">${escapeHtml(e.source_fields.join(", ") || "—")} <span class="muted">⇒</span> ${escapeHtml(e.target_fields.join(", ") || "—")}</div>
+        ${e.description ? `<div class="small muted mt8">${escapeHtml(e.description)}</div>` : ""}
+      </div>`).join("")}</div>`;
+}
+
+// ---- 事件绑定 ----
+
+function wireBusMatrixOverview() {
+  $$("[data-bm-area]").forEach((el) =>
+    el.addEventListener("click", () => busMatrixDrill(Number(el.dataset.bmArea))));
+}
+
+function wireBusMatrixArea() {
+  const back = $("#bm-back");
+  if (back) back.onclick = renderBusMatrixCard;
+  const first = $("[data-bm-cell]");
+  $$("[data-bm-cell]").forEach((el) =>
+    el.addEventListener("click", () => {
+      $$("[data-bm-cell]").forEach((x) => x.classList.remove("bm-cell-selected"));
+      el.classList.add("bm-cell-selected");
+      const [pid, did] = el.dataset.bmCell.split(":").map(Number);
+      const cell = state.busMatrix.data.cells.find((c) => c.process_id === pid && c.dimension_id === did);
+      const box = $("#bm-detail");
+      if (box && cell) box.innerHTML = busMatrixDetailHtml(state.busMatrix.data, cell);
+    }));
+  if (first) first.click();
+}
+
 // ---------------------------------------------------------------- 业务需求
 
 async function renderRequirements(content) {
@@ -516,8 +809,15 @@ async function renderRequirements(content) {
             <div class="flex"><span class="mono" style="color:var(--accent)">${escapeHtml(a.area_key)}</span><span class="grow"></span><span class="small muted">${escapeHtml(a.owner || "")}</span></div>
             <div style="font-weight:600;margin-top:2px">${escapeHtml(a.name)}</div>
             <div class="small muted mt8">${escapeHtml(a.description || "—")}</div>
+            <div class="mt8"><button class="btn btn-sm" data-bm-area="${a.id}">总线矩阵</button></div>
           </div>`).join("")}
       </div>` : `<div class="empty"><div class="empty-desc">暂无主题域。</div></div>`}
+    </div>
+    <div class="card">
+      <div class="card-title">业务总线矩阵 <span class="sub">Kimball 总线矩阵 · 业务过程 × 维度一致性视图</span>
+        <button class="btn btn-sm" id="btn-bm-refresh">刷新</button>
+      </div>
+      <div id="bus-matrix"><div class="empty chart-empty"><div class="empty-icon">◌</div><div class="empty-desc">总线矩阵推导中…</div></div></div>
     </div>
     <div class="card">
       <div class="card-title">业务需求 <span class="sub">建模工作的上游输入</span>
@@ -625,6 +925,10 @@ async function renderRequirements(content) {
   });
 
   $("#btn-new-req").onclick = () => requirementModal();
+
+  // 业务总线矩阵：默认企业级总览，主题域卡片 / 热力行均可下钻
+  $("#btn-bm-refresh").onclick = renderBusMatrixCard;
+  renderBusMatrixCard();
 }
 
 function requirementModal(req) {
@@ -3690,14 +3994,22 @@ function renderIdentityChip() {
   }
   const role = me.is_admin ? "平台管理员"
     : (currentProjectRole() ? ROLE_LABEL[currentProjectRole()] : "无项目角色");
+  const loggedIn = !!getToken();
   chip.innerHTML = `
     <span class="identity-name" title="${escapeHtml(me.user_key)}">${escapeHtml(me.display_name)}</span>
     <span class="badge ${me.is_admin ? "badge-admin" : "badge-neutral"}">${role}</span>
-    <span class="identity-mode">${me.auth_mode === "demo" ? "演示模式" : "API Key"}</span>
-    ${getToken() ? `<button class="btn btn-ghost btn-sm" id="btn-logout">退出</button>` : ""}`;
+    <span class="identity-mode">${me.auth_mode === "demo" ? (loggedIn ? "演示模式 · 已登录" : "演示模式") : "API Key"}</span>
+    ${loggedIn
+      ? `<button class="btn btn-ghost btn-sm" id="btn-logout">退出</button>`
+      : `<button class="btn btn-ghost btn-sm" id="btn-login">登录</button>`}`;
+  const loginBtn = $("#btn-login");
+  if (loginBtn) loginBtn.onclick = loginModal;
   const out = $("#btn-logout");
   if (out) {
     out.onclick = async () => {
+      // V1.3：先吊销服务端会话密钥（长期 API Key 不受影响），再清本地令牌；
+      // 吊销请求失败（如网络中断）也继续清理本地，避免卡在失效登录态。
+      try { await api("/api/auth/logout", { method: "POST" }); } catch (e) { /* 忽略 */ }
       clearToken();
       toast("已退出登录", "success");
       await loadMe();
@@ -3705,26 +4017,98 @@ function renderIdentityChip() {
     };
   }
   chip.onclick = (e) => {
-    if (e.target.id === "btn-logout") return; // 退出按钮自带处理
+    if (e.target.id === "btn-logout" || e.target.id === "btn-login") return; // 自带处理
     setView("users");
   };
 }
 
 function loginModal() {
-  formModal("登录（API Key）", [
-    { key: "token", label: "访问令牌", required: true, placeholder: "dmc_ak_xxx_xxx（创建时仅展示一次，请妥善保存）" },
-  ], "登录", async (v) => {
-    if (!v.token) { toast("请输入访问令牌", "error"); return; }
-    setToken(v.token);
+  const demo = state.me && state.me.auth_mode === "demo";
+  openModal("登录", `
+    <div class="tabs" id="login-tabs">
+      <button class="tab active" data-login-tab="password">账号密码</button>
+      <button class="tab" data-login-tab="token">API Key</button>
+    </div>
+    <div id="login-pane-password">
+      <div class="form-row"><label>账号 <span style="color:var(--danger)">*</span></label>
+        <input class="input" id="login-user" placeholder="user_key 或裸登录名（如 admin）" autocomplete="username" /></div>
+      <div class="form-row"><label>密码 <span style="color:var(--danger)">*</span></label>
+        <input class="input" id="login-pass" type="password" placeholder="••••••••" autocomplete="current-password" /></div>
+      ${demo ? `<div class="muted small mt8">演示账号（demo 模式启动时自动播种，详见 README）：
+        <b>admin</b> / Admin@123456（平台管理员）；
+        alice / Alice@123456（项目 owner）；bob / Bob@123456（editor）；
+        carol / Carol@123456（viewer）。登录后按真实角色执行权限。</div>` : ""}
+    </div>
+    <div id="login-pane-token" hidden>
+      <div class="form-row"><label>访问令牌 <span style="color:var(--danger)">*</span></label>
+        <input class="input" id="login-token" placeholder="dmc_ak_xxx_xxx（创建时仅展示一次，请妥善保存）" /></div>
+      <div class="muted small mt8">API Key 在「用户与权限 → API Key」卡片创建；平台管理员可为他人代建。</div>
+    </div>`, [
+    { label: "取消", cls: "btn-ghost", onClick: closeModal },
+    { label: "登录", cls: "btn-primary", id: "login-submit", onClick: submitLogin },
+  ]);
+  let tab = "password";
+  $$("#login-tabs .tab").forEach((btn) => {
+    btn.onclick = () => {
+      tab = btn.dataset.loginTab;
+      $$("#login-tabs .tab").forEach((b) => b.classList.toggle("active", b === btn));
+      $("#login-pane-password").hidden = tab !== "password";
+      $("#login-pane-token").hidden = tab !== "token";
+    };
+  });
+  const onKey = (e) => { if (e.key === "Enter") { e.preventDefault(); submitLogin(); } };
+  $("#login-user").addEventListener("keydown", onKey);
+  $("#login-pass").addEventListener("keydown", onKey);
+  $("#login-token").addEventListener("keydown", onKey);
+  setTimeout(() => $("#login-user").focus(), 50);
+}
+
+async function submitLogin() {
+  const panePassword = !$("#login-pane-password").hidden;
+  try {
+    if (panePassword) {
+      const user = $("#login-user").value.trim();
+      const pass = $("#login-pass").value;
+      if (!user || !pass) { toast("请输入账号和密码", "error"); return; }
+      const r = await api("/api/auth/login", {
+        method: "POST", body: JSON.stringify({ login: user, password: pass }),
+      });
+      setToken(r.token);
+      toast(`已登录：${r.display_name}`, "success");
+    } else {
+      const token = $("#login-token").value.trim();
+      if (!token) { toast("请输入访问令牌", "error"); return; }
+      setToken(token);
+    }
+    closeModal();
     const me = await loadMe();
     if (me) {
-      closeModal();
-      toast(`已登录：${me.display_name}`, "success");
       if (state.view === "users") await renderView();
     } else {
       clearToken();
       toast("令牌无效或已失效", "error");
     }
+  } catch (e) {
+    if (panePassword && e.code === "INVALID_CREDENTIALS") {
+      toast("用户名或密码错误", "error", e.code);
+    } else {
+      showError(e);
+    }
+  }
+}
+
+function passwordModal() {
+  formModal("修改密码", [
+    { key: "current_password", label: "当前密码", type: "password", required: true },
+    { key: "new_password", label: "新密码（至少 8 位）", type: "password", required: true },
+  ], "确认修改", async (v) => {
+    try {
+      await api("/api/auth/password", {
+        method: "POST", body: JSON.stringify(v),
+      });
+      closeModal();
+      toast("密码已修改", "success");
+    } catch (e) { showError(e); }
   });
 }
 
@@ -3764,6 +4148,10 @@ function identityBodyHtml(me) {
       projRows
         ? `<div class="table-wrap"><table class="table"><thead><tr><th>项目</th><th>名称</th><th>角色</th><th>有效能力</th></tr></thead><tbody>${projRows}</tbody></table></div>`
         : `<span class="muted">暂无项目成员关系</span>`}
+    </div>
+    <div class="mt14">
+      ${me.has_password ? `<button class="btn btn-sm" id="identity-change-password">修改密码</button>` : ""}
+      ${me.auth_mode === "demo" && !getToken() ? `<button class="btn btn-sm btn-primary" id="identity-login">登录（账号密码 / API Key）</button>` : ""}
     </div>`;
 }
 
@@ -3836,8 +4224,8 @@ async function renderUsers(content) {
         <div class="card-head"><div class="card-title">用户与权限</div></div>
         <div class="card-body">
           <p class="muted">当前无法获取身份信息。</p>
-          <p class="muted">演示模式（AUTH_MODE=demo）下请求以演示管理员身份放行；API Key 模式（AUTH_MODE=api_key）需要先用平台颁发的访问令牌登录，按有效权限使用各项功能。</p>
-          <div class="mt14"><button class="btn btn-primary" id="users-login">使用 API Key 登录</button></div>
+          <p class="muted">演示模式（AUTH_MODE=demo）下匿名请求以演示管理员身份放行，也可用账号密码登录后按真实角色执行权限；API Key 模式（AUTH_MODE=api_key）需要先用平台颁发的访问令牌或账号密码登录，按有效权限使用各项功能。</p>
+          <div class="mt14"><button class="btn btn-primary" id="users-login">登录（账号密码 / API Key）</button></div>
         </div>
       </div>`;
     $("#users-login").onclick = loginModal;
@@ -3848,7 +4236,7 @@ async function renderUsers(content) {
   const canManageMembers = hasProjectCap("member.manage");
   const proj = state.projects.find((p) => p.id === state.projectId);
   content.innerHTML = `
-    ${me.auth_mode === "demo" ? `<div class="demo-banner">演示模式（AUTH_MODE=demo）：权限检查已短路，界面展示完整功能形态；生产模式（api_key）下按有效权限执行。</div>` : ""}
+    ${me.auth_mode === "demo" ? `<div class="demo-banner">演示模式（AUTH_MODE=demo）：匿名请求以演示管理员身份放行；${getToken() ? "当前已登录，按真实角色执行权限校验。" : `<button class="btn btn-sm" id="demo-banner-login">登录（账号密码 / API Key）</button> 后将按真实角色执行权限校验。`}生产模式（api_key）下所有请求必须携带有效凭据。</div>` : ""}
     <div class="users-grid">
       <div class="card" id="users-identity-card">
         <div class="card-head"><div class="card-title">当前身份</div></div>
@@ -3869,6 +4257,9 @@ async function renderUsers(content) {
 
 function wireUsersView() {
   const bind = (sel, ev, fn) => { const el = $(sel); if (el) el.addEventListener(ev, fn); };
+  bind("#identity-change-password", "click", passwordModal);
+  bind("#identity-login", "click", loginModal);
+  bind("#demo-banner-login", "click", loginModal);
   if (hasPlatformCap("user.manage")) {
     bind("#users-new", "click", () => userModal());
     const q = $("#users-filter-q");

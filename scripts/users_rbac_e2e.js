@@ -154,19 +154,28 @@ const E2E_KEY_NAME = "e2e-temp-key-" + RUN;
     await waitUserCell(4, "正常");
     check("U13. 重新启用用户", true);
 
-    // ---------- U14 成员管理（PRJ_ECOM：demo admin 是唯一 owner） ----------
+    // ---------- U14 成员管理（PRJ_ECOM：V1.3 演示账号梯度 owner/editor/viewer） ----------
     await page.waitForSelector("#members-table tbody tr", { timeout: 10000 });
     const memberInfo = await page.evaluate(() => {
       const rows = Array.from(document.querySelectorAll("#members-table tbody tr"));
-      const admin = rows.find((tr) => tr.cells[0].textContent === "u:demo.admin");
-      return {
-        total: rows.length,
-        adminRole: admin ? admin.cells[3].textContent.trim() : "",
-        adminRemoveDisabled: admin ? admin.querySelector("[data-member-remove]").disabled : null,
+      const byKey = {};
+      for (const tr of rows) byKey[tr.cells[0].textContent.trim()] = {
+        role: tr.cells[3].textContent.trim(),
+        removeDisabled: tr.querySelector("[data-member-remove]").disabled,
       };
+      const admin = byKey["u:demo.admin"];
+      return { total: rows.length, admin, byKey };
     });
-    check("U14. 成员列表（唯一 owner 的移除受前端保护）",
-      memberInfo.adminRole === "所有者" && memberInfo.adminRemoveDisabled === true, JSON.stringify(memberInfo));
+    // V1.3 起演示账号按角色梯度登记为成员：alice=owner / bob=editor / carol=viewer；
+    // demo.admin 不再是唯一 owner → 移除按钮可用（最后唯一 owner 的 409 保护由
+    // pytest TestV12MemberGuard 覆盖，此处只验证梯度与前端禁用逻辑的正确联动）
+    check("U14. 成员列表（演示账号角色梯度 + 多 owner 时可移除）",
+      !!memberInfo.admin && memberInfo.admin.role === "所有者" &&
+      memberInfo.admin.removeDisabled === false &&
+      !!memberInfo.byKey["u:alice"] && memberInfo.byKey["u:alice"].role === "所有者" &&
+      !!memberInfo.byKey["u:bob"] && memberInfo.byKey["u:bob"].role === "编辑者" &&
+      !!memberInfo.byKey["u:carol"] && memberInfo.byKey["u:carol"].role === "只读",
+      JSON.stringify(memberInfo));
 
     // 添加 e2e 用户为成员
     await page.click("#members-add");

@@ -52,6 +52,9 @@ class Settings:
     # ---- V1.0 认证授权与治理配置 ----
     auth_mode: str = "demo"
     bootstrap_token: str = ""
+    # V1.3 密码登录会话时长（小时）：登录签发的会话密钥 expires_at；
+    # 到期后前端 401 自动引导重登。0 表示不过期（不推荐）。
+    auth_session_hours: int = 12
     # full_snapshot 停用比例阈值（M5）：planned/active_total 超阈值必须显式确认
     full_snapshot_deactivate_ratio_threshold: float = 0.5
     # dbt manifest 连接器规模上限（M3）：序列化后字节数与推导边数
@@ -100,6 +103,13 @@ class Settings:
         bootstrap_token = str(
             _pick(file_values, "bootstrap_token", "BOOTSTRAP_TOKEN", "")
         ).strip()
+        auth_session_hours = _as_int(
+            _pick(
+                file_values, "auth_session_hours", "AUTH_SESSION_HOURS", 12
+            )
+        )
+        if auth_session_hours < 0:
+            raise RuntimeError("auth_session_hours 不能为负数（0 表示不过期）")
         threshold = _as_float(
             _pick(
                 file_values,
@@ -119,6 +129,7 @@ class Settings:
             data_dir=data_dir,
             auth_mode=auth_mode,
             bootstrap_token=bootstrap_token,
+            auth_session_hours=auth_session_hours,
             full_snapshot_deactivate_ratio_threshold=threshold,
             dbt_manifest_max_bytes=_as_int(
                 _pick(

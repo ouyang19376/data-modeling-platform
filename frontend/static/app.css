@@ -792,3 +792,50 @@ details.lineage-panel summary:hover { color: var(--accent); }
   word-break: break-all; color: var(--success);
   user-select: all;
 }
+
+/* ---------------- 业务总线矩阵（V1.3，Kimball 总线矩阵） ---------------- */
+
+.bm-heat th.bm-corner { min-width: 190px; text-align: left; }
+.bm-heat th.bm-dim-col {
+  width: 46px; min-width: 46px; max-width: 46px;
+  text-align: center; font-size: 12px; font-weight: 600;
+  padding: 8px 2px; white-space: nowrap;
+}
+.bm-area-cell { min-width: 190px; }
+.bm-cell {
+  text-align: center; height: 36px;
+  font-weight: 650; font-variant-numeric: tabular-nums; font-size: 12.5px;
+  border-left: 1px solid var(--border-soft);
+}
+.bm-cell-0 { background: transparent; }
+.bm-cell-1 { background: rgba(79, 140, 255, 0.16); color: var(--text); }
+.bm-cell-2 { background: rgba(79, 140, 255, 0.32); color: var(--text); }
+.bm-cell-3 { background: rgba(79, 140, 255, 0.5); color: var(--text); }
+.bm-cell-4 { background: rgba(79, 140, 255, 0.72); color: #fff; }
+.bm-cell-filled {
+  background: var(--bm-cell-color, var(--accent-soft));
+  color: #fff; cursor: pointer;
+  transition: filter 0.15s var(--ease);
+}
+.bm-cell-filled:hover { filter: brightness(1.35); }
+.bm-cell-selected { outline: 2px solid var(--text); outline-offset: -2px; }
+.bm-area-row { cursor: pointer; transition: background 0.15s var(--ease); }
+.bm-area-row:hover { background: var(--panel-2); }
+.bm-heat-legend { margin-top: 8px; }
+
+.bm-edge {
+  border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
+  padding: 10px 12px; margin-bottom: 8px; background: var(--panel-2);
+}
+.bm-edge-fields { margin-top: 6px; font-size: 12.5px; color: var(--text); }
+
+.bm-notes { display: flex; flex-direction: column; gap: 8px; }
+.bm-note {
+  border-radius: var(--radius-sm); padding: 8px 12px; font-size: 12.5px;
+  border: 1px solid var(--border-soft);
+}
+.bm-note-danger { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
+.bm-note-warning { background: var(--warning-soft); color: var(--warning); border-color: transparent; }
+.bm-note-ok { background: var(--success-soft); color: var(--success); border-color: transparent; }
+
+.demo-banner .btn { vertical-align: middle; margin: 0 2px; }

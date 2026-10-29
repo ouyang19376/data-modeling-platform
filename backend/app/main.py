@@ -50,11 +50,13 @@ from .schemas import (
     ExternalLineageEdgeIn,
     ExternalLineageImport,
     FieldIn,
+    LoginIn,
     ModelConstraintCreate,
     ModelCreate,
     ModelIndexCreate,
     ModelRelationshipCreate,
     ModelUpdate,
+    PasswordChangeIn,
     ProjectCreate,
     ProjectMemberIn,
     ReviewDecision,
@@ -75,12 +77,12 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-HEAD_REVISION = "7f0c38e854e5"
+HEAD_REVISION = "d4e5f6a7b8c9"
 INITIAL_REVISION = "d50979bffe74"
 
 STARTED_AT = time.time()
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 logger = logging.getLogger(__name__)
 
@@ -806,11 +808,14 @@ async def lifespan(_app: FastAPI):
 
     # V1.0 demo 模式幂等播种演示管理员与项目 owner 成员（设计文档 3.4）；
     # 与 SEED_DEMO_DATA 解耦，仅影响 users / project_members。
+    # V1.3 同批播种演示账号矩阵（平台管理员 + owner/editor/viewer 梯度），
+    # 供密码登录与 RBAC 差异演示；已设置口令的账号重启不重置。
     if settings.auth_mode == "demo":
         from .db import SessionLocal
 
         with SessionLocal() as db:
             auth_mod.ensure_demo_admin(db)
+            auth_mod.ensure_demo_accounts(db)
             db.commit()
 
     # V0.9 升级基线：旧库已有发布模型但无图谱快照时，幂等创建一次
@@ -850,19 +855,24 @@ async def request_context_middleware(request: Request, call_next):  # noqa: ANN0
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):  # noqa: ANN001
-    """V1.0 认证中间件（仅 AUTH_MODE=api_key 生效）。
+    """V1.0 认证中间件；V1.3 起 demo 模式渐进增强。
 
-    豁免：健康检查、bootstrap 引导与非 API 路径（静态前端）；
+    豁免：健康检查、bootstrap 引导、密码登录与非 API 路径（静态前端）；
     /metrics 需要认证（admin 校验在端点内）。认证失败返回统一错误
     信封，并写审计 auth.denied + 进程内计数。
+
+    demo 模式（V1.3）：仅当请求携带 Authorization 头时才解析身份——
+    无令牌匿名放行（V0.9.2 兼容，E2E/既有测试不受影响）；携带令牌但
+    无效/过期/吊销照常 401（不静默回落演示管理员：否则被吊销的登录
+    会话会被放大为管理员权限，与 RBAC 设计意图相悖）。
     """
-    if settings.auth_mode != "api_key":
-        return await call_next(request)
     path = request.url.path
     if path in auth_mod._AUTH_EXEMPT_PATHS:
         return await call_next(request)
     if not path.startswith("/api/") and path != "/metrics":
         return await call_next(request)  # 静态前端等
+    if settings.auth_mode == "demo" and not request.headers.get("authorization"):
+        return await call_next(request)  # 匿名演示：V0.9.2 兼容
 
     result = auth_mod.authenticate(request)
     if isinstance(result, ApiError):
@@ -1094,6 +1104,252 @@ def create_subject_area(
                  actor, "success", request_id)
     db.commit()
     return subject_area_dict(area)
+
+
+# ---------------------------------------------------------------- 业务总线矩阵
+# Kimball 总线矩阵语义：行 = 业务过程（DWD/DWS 模型），列 = 维度（DIM 模型），
+# 单元格 = 过程与维度之间的直接关系。只统计显式建模的直连边——ADS 经 DWD 间接
+# 使用维度不体现在矩阵中，这正是「总线」作为声明式一致性契约的意义：一致性
+# 维度必须在过程上显式声明，才能被矩阵识别与治理。
+
+
+def _bus_matrix_dimension(m: models.DataModel) -> dict[str, Any]:
+    return {
+        "id": m.id,
+        "model_key": m.model_key,
+        "name": m.name,
+        "layer": m.layer,
+        "subject_area_id": m.subject_area_id,
+    }
+
+
+@app.get("/api/projects/{project_id}/bus-matrix",
+         dependencies=[Depends(auth_mod.require_project_role("viewer"))])
+def get_bus_matrix(
+    project_id: int,
+    subject_area_id: int | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    get_project(db, project_id)
+    areas = db.scalars(
+        select(models.SubjectArea)
+        .where(models.SubjectArea.project_id == project_id)
+        .order_by(models.SubjectArea.id)
+    ).all()
+    dimensions = db.scalars(
+        select(models.DataModel)
+        .where(
+            models.DataModel.project_id == project_id,
+            models.DataModel.layer == "DIM",
+        )
+        .order_by(models.DataModel.model_key)
+    ).all()
+    processes = db.scalars(
+        select(models.DataModel)
+        .where(
+            models.DataModel.project_id == project_id,
+            models.DataModel.layer.in_(("DWD", "DWS")),
+        )
+        .order_by(models.DataModel.model_key)
+    ).all()
+    rels = db.scalars(
+        select(models.ModelRelationship)
+        .where(models.ModelRelationship.project_id == project_id)
+    ).all()
+
+    dim_by_id = {d.id: d for d in dimensions}
+    proc_by_id = {p.id: p for p in processes}
+
+    # 过程 ↔ 维度直连边索引：{process_id: {dimension_id: [edge, ...]}}
+    edges: dict[int, dict[int, list[dict[str, Any]]]] = {}
+    for r in rels:
+        if r.source_model_id in proc_by_id and r.target_model_id in dim_by_id:
+            pid, did = r.source_model_id, r.target_model_id
+            direction = "process_to_dimension"
+        elif r.source_model_id in dim_by_id and r.target_model_id in proc_by_id:
+            pid, did = r.target_model_id, r.source_model_id
+            direction = "dimension_to_process"
+        else:
+            continue
+        edges.setdefault(pid, {}).setdefault(did, []).append({
+            "relationship_id": r.id,
+            "relationship_type": r.relationship_type,
+            "cardinality": r.cardinality,
+            "direction": direction,
+            "description": r.description,
+            "source_fields": json.loads(r.source_fields_json or "[]"),
+            "target_fields": json.loads(r.target_fields_json or "[]"),
+        })
+
+    if subject_area_id is not None:
+        area = db.get(models.SubjectArea, subject_area_id)
+        if area is None or area.project_id != project_id:
+            raise not_found(
+                "SUBJECT_AREA_NOT_FOUND", f"主题域 {subject_area_id} 不存在"
+            )
+        area_proc_ids = {p.id for p in processes if p.subject_area_id == area.id}
+        cells: list[dict[str, Any]] = []
+        for p in processes:
+            if p.id not in area_proc_ids:
+                continue
+            for d in dimensions:
+                edge_list = edges.get(p.id, {}).get(d.id)
+                if edge_list:
+                    cells.append({
+                        "process_id": p.id,
+                        "dimension_id": d.id,
+                        "edge_count": len(edge_list),
+                        "relationship_types": sorted(
+                            {e["relationship_type"] for e in edge_list}
+                        ),
+                        "field_pairs": edge_list,
+                    })
+        dim_reuse = []
+        for d in dimensions:
+            pids = [pid for pid, dd in edges.items() if d.id in dd]
+            used_areas = {proc_by_id[pid].subject_area_id for pid in pids}
+            dim_reuse.append({
+                "id": d.id,
+                "model_key": d.model_key,
+                "name": d.name,
+                "in_area_process_count": sum(1 for pid in pids if pid in area_proc_ids),
+                "out_of_area_process_count": sum(
+                    1 for pid in pids if pid not in area_proc_ids
+                ),
+                "total_process_count": len(pids),
+                "area_count": len(used_areas),
+                "is_shared": len(used_areas) > 1,
+            })
+        cross_area_relations = sum(
+            1
+            for c in cells
+            if dim_by_id[c["dimension_id"]].subject_area_id != area.id
+            for _ in c["field_pairs"]
+        )
+        return {
+            "mode": "area",
+            "subject_area": {
+                "id": area.id,
+                "area_key": area.area_key,
+                "name": area.name,
+                "owner": area.owner,
+            },
+            "processes": [
+                {
+                    "id": p.id,
+                    "model_key": p.model_key,
+                    "name": p.name,
+                    "layer": p.layer,
+                    "status": p.status,
+                    "dimension_count": len(edges.get(p.id, {})),
+                }
+                for p in processes
+                if p.id in area_proc_ids
+            ],
+            "dimensions": [_bus_matrix_dimension(d) for d in dimensions],
+            "cells": cells,
+            "dimension_reuse": dim_reuse,
+            "summary": {
+                "process_total": len(area_proc_ids),
+                "dimension_total": len(dimensions),
+                "mapped_cells": len(cells),
+                "relation_total": sum(c["edge_count"] for c in cells),
+                "unmapped_processes": [
+                    {
+                        "id": p.id,
+                        "model_key": p.model_key,
+                        "name": p.name,
+                        "layer": p.layer,
+                    }
+                    for p in processes
+                    if p.id in area_proc_ids and not edges.get(p.id)
+                ],
+                "cross_area_relations": cross_area_relations,
+                "consistency_dimensions": sum(
+                    1 for d in dim_reuse if d["is_shared"]
+                ),
+                "orphan_dimensions": sum(
+                    1 for d in dim_reuse if d["total_process_count"] == 0
+                ),
+            },
+        }
+
+    # 企业级总览：主题域 × 维度热力图（含未归属过程行）
+    matrix: list[dict[str, Any]] = []
+    for a in areas:
+        row_pids = [p.id for p in processes if p.subject_area_id == a.id]
+        matrix.append({
+            "subject_area": {
+                "id": a.id,
+                "area_key": a.area_key,
+                "name": a.name,
+                "owner": a.owner,
+            },
+            "unassigned": False,
+            "process_count": len(row_pids),
+            "counts": [
+                sum(1 for pid in row_pids if d.id in edges.get(pid, {}))
+                for d in dimensions
+            ],
+        })
+    unassigned_pids = [p.id for p in processes if p.subject_area_id is None]
+    if unassigned_pids:
+        matrix.append({
+            "subject_area": None,
+            "unassigned": True,
+            "process_count": len(unassigned_pids),
+            "counts": [
+                sum(1 for pid in unassigned_pids if d.id in edges.get(pid, {}))
+                for d in dimensions
+            ],
+        })
+    shared_dimensions = []
+    orphan_dimensions = []
+    for d in dimensions:
+        pids = [pid for pid, dd in edges.items() if d.id in dd]
+        used_areas = {proc_by_id[pid].subject_area_id for pid in pids}
+        if not pids:
+            orphan_dimensions.append(
+                {"id": d.id, "model_key": d.model_key, "name": d.name}
+            )
+        elif len(used_areas) > 1:
+            shared_dimensions.append({
+                "id": d.id,
+                "model_key": d.model_key,
+                "name": d.name,
+                "area_count": len(used_areas),
+                "process_count": len(pids),
+            })
+    shared_dimensions.sort(
+        key=lambda x: (-x["area_count"], -x["process_count"], x["model_key"])
+    )
+    return {
+        "mode": "overview",
+        "dimensions": [_bus_matrix_dimension(d) for d in dimensions],
+        "matrix": matrix,
+        "summary": {
+            "subject_area_total": len(areas),
+            "process_total": len(processes),
+            "dimension_total": len(dimensions),
+            "mapped_cells": sum(len(dd) for dd in edges.values()),
+            "relation_total": sum(
+                len(es) for dd in edges.values() for es in dd.values()
+            ),
+            "shared_dimensions": shared_dimensions,
+            "orphan_dimensions": orphan_dimensions,
+            "unmapped_processes": [
+                {
+                    "id": p.id,
+                    "model_key": p.model_key,
+                    "name": p.name,
+                    "layer": p.layer,
+                    "subject_area_id": p.subject_area_id,
+                }
+                for p in processes
+                if not edges.get(p.id)
+            ],
+        },
+    }
 
 
 # ---------------------------------------------------------------- 业务需求
@@ -5027,14 +5283,20 @@ def api_key_dict(k: models.ApiKey) -> dict[str, Any]:
 
 
 def _current_user(db: Session, request: Request) -> models.User:
-    """取当前认证主体；demo 模式回落演示管理员（幂等播种）。"""
+    """取当前认证主体。
+
+    V1.3：携带有效 Bearer 令牌（两种模式）→ 真实主体；demo 模式匿名
+    → 回落演示管理员（幂等播种，V0.9.2 兼容）。
+    """
+    identity = getattr(request.state, "identity", None)
+    if identity is not None:
+        user = db.get(models.User, identity.user_id)
+        if user is None:
+            raise ApiError(401, "AUTH_REQUIRED", "身份主体不存在，请重新引导")
+        return user
     if settings.auth_mode == "demo":
         return auth_mod.ensure_demo_admin(db)
-    identity = auth_mod.require_authenticated(request)
-    user = db.get(models.User, identity.user_id)
-    if user is None:
-        raise ApiError(401, "AUTH_REQUIRED", "身份主体不存在，请重新引导")
-    return user
+    raise ApiError(401, "AUTH_REQUIRED", "缺少身份信息")
 
 
 @app.get("/api/auth/me")
@@ -5059,6 +5321,7 @@ def auth_me(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
         "auth_mode": settings.auth_mode,
         "is_admin": bool(user.is_admin),
         "status": user.status,
+        "has_password": user.password_hash is not None,
         "capabilities": {
             "platform": auth_mod.platform_capabilities(bool(user.is_admin)),
             "projects": [
@@ -5226,6 +5489,102 @@ def bootstrap_endpoint(
         "key_id": key.key_id,
         "secret": f"dmc_{key.key_id}_{secret}",
     }
+
+
+# ---------------------------------------------------------------- V1.3 密码登录
+
+
+@app.post("/api/auth/login")
+def login_endpoint(
+    payload: LoginIn, request: Request, db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """账号密码登录：成功签发会话密钥（Bearer dmc_<key_id>_<secret>）。
+
+    - 用户名不存在 / 未设密码 / 口令错误 / 主体禁用：统一
+      401 INVALID_CREDENTIALS（不泄露主体存在性）；
+    - 会话密钥 name=``session:web``，expires_at 按 AUTH_SESSION_HOURS
+      （0 表示不过期）；退出登录（POST /api/auth/logout）即时吊销；
+    - demo 与 api_key 模式均可用（登录本身免认证，见豁免路径）；
+    - 登录成功/失败均写审计（auth.login / auth.login_failed）。
+    """
+    try:
+        user, key, secret = auth_mod.login_with_password(
+            db, payload.login, payload.password
+        )
+    except ApiError:
+        record_audit(
+            db, "auth", f"login={payload.login}", "auth.login_failed",
+            "", "denied", request.state.request_id,
+        )
+        db.commit()
+        raise
+    record_event(db, 0, "auth.login", user.user_key,
+                 {"user_key": user.user_key, "key_id": key.key_id},
+                 request.state.request_id)
+    record_audit(db, "auth", user.user_key, "auth.login",
+                 user.user_key, "success", request.state.request_id)
+    db.commit()
+    return {
+        "token": f"dmc_{key.key_id}_{secret}",
+        "user_key": user.user_key,
+        "display_name": user.display_name,
+        "is_admin": bool(user.is_admin),
+        "auth_mode": settings.auth_mode,
+        "expires_at": iso(key.expires_at),
+    }
+
+
+@app.post("/api/auth/logout")
+def logout_endpoint(
+    request: Request, db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """退出登录：吊销当前 Bearer 令牌对应的会话密钥。
+
+    仅吊销 name=``session:web`` 的会话密钥——长期 API Key 不受影响
+    （避免把登出误用为密钥吊销通道）；无令牌或非会话密钥时
+    revoked=false（demo 匿名调用同样安全幂等）。
+    """
+    identity = getattr(request.state, "identity", None)
+    if identity is None:
+        return {"revoked": False}
+    key_id = auth_mod.key_id_of_token(request.headers.get("authorization"))
+    if key_id is None:
+        return {"revoked": False}
+    key = db.scalar(
+        select(models.ApiKey).where(
+            models.ApiKey.key_id == key_id,
+            models.ApiKey.user_id == identity.user_id,
+        )
+    )
+    if key is None or key.name != auth_mod.SESSION_KEY_NAME:
+        return {"revoked": False}
+    auth_mod.revoke_api_key(db, key)
+    record_audit(db, "auth", key.key_id, "auth.logout",
+                 identity.user_key, "success", request.state.request_id)
+    db.commit()
+    return {"revoked": True, "key_id": key.key_id}
+
+
+@app.post("/api/auth/password")
+def change_password_endpoint(
+    payload: PasswordChangeIn,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """修改本人密码：校验当前口令后重设（V1.3）。
+
+    新密码 ≥8 位且不得与当前相同；修改成功后该主体既有会话密钥
+    不自动吊销（改密不等于踢人；如需全端下线走用户管理禁用/启用的
+    缓存即时失效路径）。
+    """
+    user = _current_user(db, request)
+    auth_mod.change_password(
+        db, user, payload.current_password, payload.new_password
+    )
+    record_audit(db, "auth", user.user_key, "auth.password_changed",
+                 user.user_key, "success", request.state.request_id)
+    db.commit()
+    return {"user_key": user.user_key, "changed": True}
 
 
 # ---------------------------------------------------------------- V1.2 用户管理（平台级）

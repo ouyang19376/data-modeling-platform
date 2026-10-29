@@ -556,7 +556,8 @@ class User(Base):
 
     user_key 全局唯一，模式 `^[a-z]+:[A-Za-z0-9_.-]{1,64}$`（如 u:alice、
     sa:dbt-importer）；auth_source 为 OIDC 预留。status=disabled 后该主体
-    的全部密钥即时失效（认证路径实时校验）。
+    的全部密钥即时失效（认证路径实时校验）。password_hash 为可空的
+    PBKDF2 哈希串（V1.3 密码登录）；NULL 表示仅密钥/演示身份主体。
     """
 
     __tablename__ = "users"
@@ -578,6 +579,12 @@ class User(Base):
         String(24), default="local", nullable=False
     )
     status: Mapped[str] = mapped_column(String(24), default="active", nullable=False)
+    # V1.3 密码登录：PBKDF2-HMAC-SHA256 哈希（格式见 auth.hash_password）。
+    # 可空：服务账号与仅密钥主体无密码；种子演示账号在 demo 模式启动时
+    # 幂等播种（见 auth.ensure_demo_accounts）。
+    password_hash: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

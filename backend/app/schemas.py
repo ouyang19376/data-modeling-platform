@@ -251,6 +251,23 @@ class BootstrapIn(BaseModel):
     display_name: str = Field(min_length=1, max_length=160)
 
 
+# ---------------------------------------------------------------- 密码登录（V1.3）
+
+
+class LoginIn(BaseModel):
+    """账号密码登录：login 接受 user_key 原样或裸登录名（自动补 u: 前缀）。"""
+
+    login: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class PasswordChangeIn(BaseModel):
+    """修改本人密码：需校验当前口令；新口令 ≥8 位且不得与当前相同。"""
+
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 class ProjectMemberIn(BaseModel):
     """项目成员 upsert：(project, user) 唯一，幂等改角色。"""
 

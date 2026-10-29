@@ -4,14 +4,14 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009485.svg)
 ![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.x-d71f18.svg)
-![Tests](https://img.shields.io/badge/tests-183%20passed-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-207%20passed-brightgreen.svg)
 
 通用型数据开发管理平台的第一个纵向闭环：**数据建模中心**。
 覆盖业务调研（主题域/业务需求）→ 模型设计（字段/表级约束/索引/关系）→ 规范校验 → 评审发布 → 版本差异 → DDL 预览 全链路，并提供模型关系图与变更影响分析（候选级）。
 
 技术栈：FastAPI + SQLAlchemy 2.x + Alembic + SQLite（默认）/ PostgreSQL（生产目标），前端为原生 HTML/CSS/JS 单页应用，API 驱动。
 
-当前版本 **V1.2.0**：在 V1.0 真实认证（API Key）与项目级三角色授权之上，陆续交付 V1.1 工作台图表与布局改版、V1.2 两级 RBAC 用户权限体系（平台 admin + 项目 owner/editor/viewer、集中式能力矩阵、八条防护规则）与 Neo4j 级交互图谱画布。功能全貌见[核心业务闭环](#核心业务闭环)与[界面预览](#界面预览)。
+当前版本 **V1.3.0**：在 V1.0 真实认证（API Key）与项目级三角色授权之上，陆续交付 V1.1 工作台图表与布局改版、V1.2 两级 RBAC 用户权限体系（平台 admin + 项目 owner/editor/viewer、集中式能力矩阵、八条防护规则）、Neo4j 级交互图谱画布，以及 V1.3 账号密码登录（演示账号矩阵 + demo 模式渐进增强认证）与业务总线矩阵（Kimball 过程 × 维度一致性视图）。功能全貌见[核心业务闭环](#核心业务闭环)与[界面预览](#界面预览)。
 
 ## 界面预览
 
@@ -24,11 +24,15 @@
 </tr>
 <tr>
 <td align="center"><img src="docs/screenshots/03-graph-canvas.png" alt="模型关系图" width="100%"><br><b>模型关系图</b>：Neo4j 级画布（力导向/分层布局、缩放拖拽、四视图切换）</td>
-<td align="center"><img src="docs/screenshots/04-requirements.png" alt="业务需求" width="100%"><br><b>业务需求</b>：主题域卡片 + 关键词/业务域/优先级/状态组合筛选</td>
+<td align="center"><img src="docs/screenshots/04-requirements.png" alt="业务需求" width="100%"><br><b>业务需求</b>：主题域卡片 + 业务总线矩阵总览 + 需求组合筛选</td>
 </tr>
 <tr>
 <td align="center"><img src="docs/screenshots/05-path-result.png" alt="最短路径与血缘面板" width="100%"><br><b>最短路径与血缘</b>：BFS 路径结果分页 + 快照对比 / 外部血缘导入</td>
 <td align="center"><img src="docs/screenshots/06-users-rbac.png" alt="用户与权限" width="100%"><br><b>用户与权限（V1.2 RBAC）</b>：身份能力 / 用户管理 / 项目成员 / API Key 四卡</td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screenshots/07-bus-matrix.png" alt="域内总线矩阵" width="100%"><br><b>域内总线矩阵（V1.3）</b>：业务过程 × 维度明细矩阵，色块按关系类型着色</td>
+<td align="center"><img src="docs/screenshots/08-bus-matrix-detail.png" alt="维度复用与字段映射" width="100%"><br><b>维度复用与字段映射</b>：本域/外域复用对比图 + 单元格字段映射下钻</td>
 </tr>
 </table>
 
@@ -52,7 +56,7 @@ uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 > 所有配置项集中在 `config.yaml`（模板 `config.example.yaml`，每项含注释），
 > 也可用环境变量覆盖（优先级：环境变量 > config.yaml > 默认值），详见[配置](#配置)。
 
-首次启动会在 `data/platform.db` 自动执行 Alembic 迁移（revision `7f0c38e854e5`），
+首次启动会在 `data/platform.db` 自动执行 Alembic 迁移（revision `d4e5f6a7b8c9`），
 并注入演示数据：项目 `PRJ_RETAIL`（零售分析）、主题域、需求 `REQ_CONTRACT_001`、
 已发布模型 `dwd_contract`（V1）与草稿模型 `dim_customer`（含两者间 `joins_to` 关系），可直接体验完整功能。
 
@@ -60,12 +64,13 @@ uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 > 详见下文[电商数仓演示数据集](#电商数仓演示数据集)。需要最小演示集时删除 `data/platform.db`
 > 后按上述命令重启即可恢复 `PRJ_RETAIL`。
 
-## 认证模式（V1.0）
+## 认证模式（V1.0 / V1.3）
 
 `AUTH_MODE` 双模式，启动门禁校验：
 
 - `demo`（默认）：`X-Actor` 演示身份，所有授权检查短路，行为与 V0.9.2 完全一致；
-  启动时幂等播种演示管理员（`u:demo.admin`）与每个既有项目的 owner 成员
+  启动时幂等播种演示管理员（`u:demo.admin`）与每个既有项目的 owner 成员，
+  并按角色梯度播种 4 个演示账号（见下文[账号密码登录](#账号密码登录v13)）
 - `api_key`：`Authorization: Bearer dmc_<key_id>_<secret>`；服务端只存
   `SHA-256(secret)` 摘要（`hmac.compare_digest` 常量时间比较），secret 仅在创建响应返回一次；
   进程内密钥缓存 TTL 60s，吊销/禁用即时失效。首次启用需一次性引导：
@@ -75,6 +80,38 @@ uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 平台 admin（`users.is_admin`）旁路全部项目检查。未认证 401、非成员 403
 PROJECT_ACCESS_DENIED、角色不足 403 PROJECT_ROLE_INSUFFICIENT。
 平台级用户管理与 RBAC 防护规则详见下文「用户与权限（V1.2 RBAC）」。
+
+## 账号密码登录（V1.3）
+
+在 API Key 之外新增用户名 + 密码登录，与既有认证体系复用同一套令牌基础设施：
+
+- **口令哈希**：PBKDF2-HMAC-SHA256 60 万次迭代（OWASP 2023 推荐），
+  格式 `pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>`（Django 风格，迭代次数内嵌、
+  可平滑升级），`hmac.compare_digest` 常量时间比较；登录失败统一 401
+  `INVALID_CREDENTIALS`（不泄露账号存在性）
+- **会话复用 api_keys 表**：登录签发 `name="session:web"` 的会话密钥
+  （有效期 `auth_session_hours`，默认 12 小时，0 为不过期），Bearer 解析 /
+  密钥缓存 / 吊销即时失效全套机制零改动复用；登出只吊销会话密钥，
+  不动长期 API Key
+- **demo 模式渐进增强**：不携带令牌 → 匿名演示放行（与 V0.9.2 一致）；
+  携带有效令牌 → 按真实身份强制 RBAC；携带无效/过期/吊销令牌 → 照常 401
+  （不静默回落演示管理员，避免被吊销会话放大为管理员权限）
+- **登录名归一化**：裸名与完整 user_key 等价（`admin` ≡ `u:admin`）
+- **改密**：`POST /api/auth/password`（需当前密码，新密码 ≥8 位）；
+  播种幂等——已改密的账号重启不重置
+
+演示账号矩阵（`AUTH_MODE=demo` 启动时自动播种，按角色登记为全部既有项目成员）：
+
+| 登录名 | 口令 | 平台角色 | 项目角色 | 用途 |
+| --- | --- | --- | --- | --- |
+| `admin` | `Admin@123456` | 平台管理员 | owner | 平台管理 + 全部项目 |
+| `alice` | `Alice@123456` | — | owner | 项目负责人演示 |
+| `bob` | `Bob@123456` | — | editor | 建模编辑演示 |
+| `carol` | `Carol@123456` | — | viewer | 只读审计演示 |
+
+> 以上口令仅用于本地演示；生产部署（`auth_mode=api_key`）不播种任何默认口令。
+> 登录入口：顶栏身份芯片「登录」按钮，或「用户与权限」视图当前身份卡 /
+> 演示横幅中的登录按钮；登录弹窗内含账号密码 / API Key 双页签。
 
 ## 用户与权限（V1.2 RBAC）
 
@@ -134,6 +171,7 @@ cp config.example.yaml config.yaml   # 复制模板到仓库根目录，按需�
 | `dbt_manifest_max_bytes` | `8388608` | `DBT_MANIFEST_MAX_BYTES` | dbt manifest 连接器序列化后体积上限（8MiB） |
 | `dbt_manifest_max_edges` | `1000` | `DBT_MANIFEST_MAX_EDGES` | dbt manifest 连接器推导边数上限 |
 | `auth_cache_ttl_seconds` | `60` | `AUTH_CACHE_TTL_SECONDS` | API Key 认证缓存 TTL（吊销/禁用即时失效不依赖 TTL） |
+| `auth_session_hours` | `12` | `AUTH_SESSION_HOURS` | 账号密码登录的会话密钥有效期（小时，0 = 不过期） |
 
 服务器部署示例（PostgreSQL + api_key 模式）：
 
@@ -153,7 +191,7 @@ seed_demo_data: false
 python -m pytest tests/ -v
 ```
 
-183 个集成测试覆盖：主链路、乐观并发 409、状态守卫、跨项目边界、
+207 个集成测试覆盖：主链路、乐观并发 409、状态守卫、跨项目边界、
 版本 diff、三引擎 DDL、request_id 传播、迁移烟测（upgrade/downgrade/upgrade）、
 V0.7 字段设计器（唯一约束/字段 ID 稳定性/默认值白名单/类型参数规则/非草稿 409）、
 V0.8 表级约束与索引（CRUD、PK/CHECK/FK 规则、DDL 三引擎约束输出）、
@@ -177,7 +215,13 @@ failed 重试保留计数/阈值可配置）、V1.0 可观测（modeling_* 指�
 health SQL 聚合与旧实现对拍/api_key 模式 /metrics admin-only 与拒绝计数）、
 V1.2 用户管理与 RBAC（/api/auth/me capabilities 两级能力矩阵/用户 CRUD 与筛选/
 最后 admin 与自降级自禁用防护/禁用与降级即时失效密钥缓存/成员 upsert 唯一 owner
-保护/双 admin 互降后项目旁路失效）。
+保护/双 admin 互降后项目旁路失效）、
+V1.3 账号密码登录（播种幂等且改密不重置/登录成功与 me 身份反映/裸名与全键等价/
+错密码与未知用户统一 401/禁用用户 401/api_key 模式可登录/demo 匿名放行与无效
+令牌 401 不静默回落/登录后 viewer 403、editor 201 按真实角色强制/admin 端点
+令牌鉴权/登出吊销即时生效且不动长期密钥/改密四项守卫/口令哈希不外泄）、
+V1.3 业务总线矩阵（总览热力行列与汇总/域内单元格与字段映射明细/维度侧发起
+方向归一化/未归属过程行/空项目/404 守卫/viewer 可读）。
 
 ### 浏览器 E2E（playwright）
 
@@ -189,10 +233,12 @@ Chrome / Chromium；无系统浏览器时先 `npx playwright install chromium`
 node scripts/users_rbac_e2e.js        # 用户与权限（V1.2 RBAC）22 项断言
 node scripts/walkthrough_all_views.js # 全页面走查 14 项断言
 node scripts/ui_revamp_e2e.js         # 工作台图表与 UI 改版 19 项断言
+node scripts/bus_matrix_e2e.js        # 业务总线矩阵（V1.3）15 项断言
 node scripts/neo4j_graph_e2e.js       # Neo4j 画布图谱交互 37 项断言
 ```
 
-四套共 **92 项断言**，覆盖 RBAC 全流程、页面走查、图表与筛选、图谱画布交互
+五套共 **107 项断言**，覆盖 RBAC 全流程、页面走查、图表与筛选、总线矩阵
+（总览热力图/域内下钻/字段映射明细/主题域卡片入口）、图谱画布交互
 （缩放/拖拽/聚焦/布局切换/视图切换/路径高亮），均要求控制台零错误；
 截图输出到 `.playwright-cli-e2e/`（可用 `E2E_SHOT_DIR` 覆盖）。
 
@@ -350,8 +396,23 @@ draft ──submit-review(校验无阻断错误)──▶ in_review ──approv
   自降级/自禁用、成员唯一 owner）与越权窗口（禁用/降级即时失效密钥缓存）；
   「用户与权限」视图四卡（当前身份/用户管理/项目成员/API Key）+ 顶栏身份芯片 +
   Bearer 令牌登录态（失效自动清除重登）
+- **账号密码登录（V1.3）**：PBKDF2-HMAC-SHA256 60 万次迭代口令哈希（Django 风格
+  可升级格式、常量时间比较、登录失败统一 401 不泄露存在性）；会话签发复用
+  `api_keys` 表（`session:web`，默认 12h 有效期，登出只吊销会话不动长期密钥）；
+  demo 模式渐进增强（无令牌匿名放行 / 有令牌按真实角色强制 RBAC / 无效令牌照常
+  401 不静默回落）；4 个演示账号按角色梯度幂等播种（改密重启不重置）；
+  登录弹窗账号密码 / API Key 双页签，身份芯片、当前身份卡、演示横幅三个登录入口
+- **业务总线矩阵（V1.3）**：Kimball 总线矩阵落地——`GET /api/projects/{id}/bus-matrix`
+  从模型分层与关系边推导。**企业总览**：主题域 × 维度热力图（单元格 = 域内引用该维度
+  的过程数，色阶分四级，含未归属过程行）+ 维度复用度条形图（跨域复用即一致性维度）+
+  一致性维度榜 + 治理提示（孤岛维度 / 未挂载过程）。**域内下钻**：行 = 域内 DWD/DWS
+  业务过程、列 = 全项目 14 个 DIM 维度（列跨域以体现一致性维度），单元格按关系类型
+  着色，点击出字段映射明细（关系类型/基数/方向/字段对/说明）；维度复用对比图区分
+  本域/外域引用。矩阵只统计显式建模的直连边——ADS 经 DWD 间接使用维度不计入，
+  这正是总线作为声明式一致性契约的意义；入口在业务需求视图（主题域卡片按钮 +
+  热力行点击），viewer 可读
 
-## API 一览（68 个端点：67 个 /api + /metrics）
+## API 一览（72 个端点：71 个 /api + /metrics）
 
 - 健康：`/api/health/live`、`/api/health/ready`、`/api/health`
 - 项目/主题域/需求：CRUD + 需求-模型关联
@@ -369,9 +430,14 @@ draft ──submit-review(校验无阻断错误)──▶ in_review ──approv
   `POST /api/projects/{id}/lineage/edges/{edge_id}/deactivate`、
   `GET /api/projects/{id}/lineage/import-runs`、`GET /api/projects/{id}/lineage/health`、
   `GET /api/projects/{id}/lineage/stale-candidates`
-- 认证与授权（V1.0）：`POST /api/auth/bootstrap`（一次性引导）、`GET /api/auth/me`、
+- 认证与授权（V1.0/V1.3）：`POST /api/auth/bootstrap`（一次性引导）、`GET /api/auth/me`、
+  `POST /api/auth/login`（账号密码登录，签发会话密钥）、
+  `POST /api/auth/logout`（吊销当前会话密钥）、
+  `POST /api/auth/password`（修改本人密码）、
   `GET/POST /api/auth/api-keys`（secret 仅创建返回一次）、
   `POST /api/auth/api-keys/{key_id}/revoke`
+- 业务总线矩阵（V1.3）：`GET /api/projects/{id}/bus-matrix`（企业总览；
+  `?subject_area_id=N` 域内明细，viewer 可读）
 - 项目成员（V1.0）：`GET/POST /api/projects/{id}/members`、
   `DELETE /api/projects/{id}/members/{user_id}`（owner 专属；最后 owner 409 保护）
 - 用户管理（V1.2）：`GET /api/users`（status/q 过滤）、`POST /api/users`、
@@ -398,31 +464,36 @@ backend/app/       FastAPI 应用（config/db/models/schemas/validation/ddl/auth
 migrations/        Alembic 迁移（0001 初始 6 表 + 0002 V0.6 增量 4 表 1 列 + V0.7 is_unique
                    + V0.8 model_constraints/model_indexes + V0.9 三表
                    + V0.9.1 scope 治理列 + V0.9.2 scope 身份键
-                   + V1.0 users/api_keys/project_members + deactivation_confirmed）
+                   + V1.0 users/api_keys/project_members + deactivation_confirmed
+                   + V1.3 users.password_hash 密码登录基座）
 frontend/static/   原生 HTML/CSS/JS 单页工作台（含 Neo4j 画布图谱（neovis.js）、
                    约束/索引设计器、影响分析、图谱视图切换/快照浏览器/
                    路径查询/血缘导入面板、工作台 SVG 图表与需求明细筛选、
-                   用户与权限管理（令牌登录/身份芯片/四卡视图））
+                   业务总线矩阵（总览热力图/域内下钻/字段映射明细）、
+                   用户与权限管理（账号密码登录/令牌登录/身份芯片/四卡视图））
 scripts/           浏览器 E2E（e2e_launch.js 跨平台启动 helper、
                    neo4j_graph_e2e.js 图谱画布 37 项、
                    users_rbac_e2e.js 用户与权限 22 项、
+                   bus_matrix_e2e.js 业务总线矩阵 15 项、
                    walkthrough_all_views.js 全页面走查 14 项、
                    ui_revamp_e2e.js UI 改版 19 项；playwright 直驱系统 Chrome）、
                    演示数据种子（seed_graph_demo.py、seed_ecommerce_demo.py
                    电商数仓 114 模型 + check_seed_spec.py 规格静态校验 +
                    verify_ecommerce_demo.py API 层 29 项验收）、
-                   发布打包（package_release.py：python scripts/package_release.py v1.2
-                   → data-modeling-center-v1.2.zip，含源码/文档/演示库）
-tests/             pytest 集成测试（183 个）
+                   发布打包（package_release.py：python scripts/package_release.py v1.3
+                   → data-modeling-center-v1.3.zip，含源码/文档/演示库）
+tests/             pytest 集成测试（207 个）
 docs/              需求与技术设计文档、API 契约（openapi.json 当前版本 /
                    API 接口契约.json 早期契约）、迁移脚本、ERD、界面截图
-                   （screenshots/；v1.0/、v1.1/、v1.2/ 为各版本设计资料）
+                   （screenshots/；v0.7/–v1.2/ 为各版本设计资料）
 ```
 
 ## 已知限制（V1.0 边界）
 
 - `AUTH_MODE=demo` 仅适合本地演示（`X-Actor` 身份可伪造）；生产须 `api_key` 模式，
   且当前仅覆盖本服务自身密钥，未接 OAuth/LDAP 等外部身份源
+- demo 模式播种的 4 个演示账号使用固定默认口令（如 `Admin@123456`，仅本地演示）；
+  对外暴露前应修改口令或停用这些账号
 - RBAC 仅内置「平台 admin + 项目三角色」，不支持自定义角色；账号锁死的恢复路径为
   停服务直接改库（无逃生舱 API），见 V1.2 设计文档「明确不做的事」
 - 模型关系图画布（neovis.js）当前经 dataFunction 适配器消费 REST 图谱接口，

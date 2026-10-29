@@ -49,6 +49,7 @@ os.environ["ALLOW_DEMO_ACTOR_HEADER"] = "true"
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import func, select  # noqa: E402
 
 from backend.app import auth as auth_mod  # noqa: E402
 from backend.app import models as models_mod  # noqa: E402
@@ -166,8 +167,8 @@ class TestHealth:
         body = r.json()
         assert body["status"] == "ready"
         assert body["database"] == "ok"
-        assert body["revision"] == "7f0c38e854e5"
-        assert body["head"] == "7f0c38e854e5"
+        assert body["revision"] == "d4e5f6a7b8c9"
+        assert body["head"] == "d4e5f6a7b8c9"
 
     def test_compat_health(self, client):
         r = client.get("/api/health")
@@ -1654,7 +1655,7 @@ class TestMigrationSmoke:
 
         r = alembic("current")
         assert r.returncode == 0, r.stderr
-        assert "7f0c38e854e5" in r.stdout
+        assert "d4e5f6a7b8c9" in r.stdout
 
         r = alembic("downgrade", "-1")
         assert r.returncode == 0, r.stderr
@@ -1663,7 +1664,7 @@ class TestMigrationSmoke:
         assert r.returncode == 0, r.stderr
 
         r = alembic("current")
-        assert "7f0c38e854e5" in r.stdout
+        assert "d4e5f6a7b8c9" in r.stdout
 
 
 # ---------------------------------------------------------------- V0.9：图谱快照 / 视图 / diff / path / 外部血缘
@@ -2589,6 +2590,12 @@ class TestV09MigrationDowngradeGuard:
             )
             conn.commit()
 
+        # V1.3 迁移降级：password_hash 均为 NULL，守卫放行，回到 V1.0 head
+        r = alembic("downgrade", "-1")
+        assert r.returncode == 0, r.stderr
+        r = alembic("current")
+        assert "7f0c38e854e5" in r.stdout
+
         # V1.0 迁移降级：三张新表为空，保护不触发，成功回到 V0.9.2 head
         r = alembic("downgrade", "-1")
         assert r.returncode == 0, r.stderr
@@ -3264,6 +3271,13 @@ class TestV10Migration:
             conn.commit()
 
         # 降级必须被中止，revision 保持 head
+        # V1.3 先行降级：password_hash 均为 NULL，守卫放行
+        r = alembic("downgrade", "-1")
+        assert r.returncode == 0, r.stderr
+        r = alembic("current")
+        assert "7f0c38e854e5" in r.stdout
+
+        # V1.0 守卫：认证三表有数据 → 中止，revision 保持
         r = alembic("downgrade", "-1")
         assert r.returncode != 0
         output = r.stdout + r.stderr
@@ -3281,6 +3295,49 @@ class TestV10Migration:
         assert r.returncode == 0, r.stderr
         r = alembic("current")
         assert "b5f2c4a9d703" in r.stdout
+
+    def test_downgrade_blocked_with_password_hashes(self):
+        """V1.3 迁移降级保护：存在已设置密码的主体时 downgrade 必须中止，
+        revision 保持 head；清理密码哈希后才允许降级（凭证材料不可再生）。"""
+        db_file = Path(_TMP_DIR) / "v13_downgrade_guard.db"
+        env = dict(os.environ)
+        env["DATABASE_URL"] = f"sqlite:///{db_file}"
+        env["APP_ENV"] = "test"
+
+        def alembic(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [sys.executable, "-m", "alembic", *args],
+                cwd=str(PROJECT_ROOT), env=env,
+                capture_output=True, text=True, timeout=120,
+            )
+
+        r = alembic("upgrade", "head")
+        assert r.returncode == 0, r.stderr
+
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "INSERT INTO users (id, user_key, display_name, kind, "
+                "is_admin, auth_source, status, password_hash, created_at) "
+                "VALUES (1,'u:pwd','有密码','human',1,'local','active',"
+                "'pbkdf2_sha256$600000$aa$bb','2026-01-01 00:00:00')")
+            conn.commit()
+
+        r = alembic("downgrade", "-1")
+        assert r.returncode != 0
+        output = r.stdout + r.stderr
+        assert "中止降级" in output
+        assert "1 个已设置密码的主体" in output
+        r = alembic("current")
+        assert "d4e5f6a7b8c9" in r.stdout  # revision 未变
+
+        # 清理密码哈希后降级成功
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute("UPDATE users SET password_hash = NULL")
+            conn.commit()
+        r = alembic("downgrade", "-1")
+        assert r.returncode == 0, r.stderr
+        r = alembic("current")
+        assert "7f0c38e854e5" in r.stdout
 
 
 # ---------------------------------------------------------------- V1.0：dbt manifest 连接器（M3）
@@ -4165,8 +4222,8 @@ class TestV10Observability:
                     "avg_duration_ms", "note"):
             assert key in b
         # V1.0 增量
-        assert b["app_version"] == "1.2.0"
-        assert b["head_revision"] == "7f0c38e854e5"
+        assert b["app_version"] == "1.3.0"
+        assert b["head_revision"] == "d4e5f6a7b8c9"
         assert b["auth"]["mode"] == "demo"
         assert isinstance(b["auth"]["denied_total"], int)
         lineage = b["lineage"]
@@ -4512,3 +4569,530 @@ class TestV12MemberGuard:
             admin_secret, json={"user_key": "u:v12p4", "role": "viewer"})
         assert r.status_code == 200
         assert r.json()["role"] == "viewer"
+
+
+# ---------------------------------------------------------------- V1.3 密码登录
+
+_V13_ACCOUNTS = {
+    "admin": "Admin@123456",
+    "alice": "Alice@123456",
+    "bob": "Bob@123456",
+    "carol": "Carol@123456",
+}
+
+
+def _v13_seed_accounts() -> None:
+    """按启动同路径幂等播种演示账号（测试库直连，等价于一次重启）。
+
+    前置测试可能清空 users 表（V1.0 引导用例），故每个用例先补播种；
+    已存在且有密码的账号不会被重置（尊重改密）。
+    """
+    from backend.app.db import SessionLocal
+
+    with SessionLocal() as db:
+        auth_mod.ensure_demo_accounts(db)
+        db.commit()
+
+
+def _v13_login(c: TestClient, login: str, password: str):
+    return c.post("/api/auth/login",
+                  json={"login": login, "password": password})
+
+
+def _v13_token(c: TestClient, login: str) -> str:
+    """登录并返回会话令牌（login 须存在于 _V13_ACCOUNTS）。"""
+    r = _v13_login(c, login, _V13_ACCOUNTS[login])
+    assert r.status_code == 200, r.text
+    return r.json()["token"]
+
+
+class TestV13PasswordLogin:
+    """V1.3 密码登录：账号矩阵播种、登录/登出、改密、demo 渐进增强。"""
+
+    def test_seed_accounts_idempotent_and_password_not_reset(self, client):
+        _v13_seed_accounts()
+        from backend.app.db import SessionLocal
+
+        with SessionLocal() as db:
+            n1 = db.scalar(select(func.count(models_mod.User.id)))
+            keys = sorted(db.scalars(
+                select(models_mod.User.user_key).where(
+                    models_mod.User.user_key.like("u:%")
+                )
+            ).all())
+        _v13_seed_accounts()
+        with SessionLocal() as db:
+            n2 = db.scalar(select(func.count(models_mod.User.id)))
+        assert n1 == n2
+        for expected in ("u:admin", "u:alice", "u:bob", "u:carol"):
+            assert expected in keys
+        # 改密后重新播种不重置口令
+        r = _v13_login(client, "bob", "Bob@123456")
+        assert r.status_code == 200, r.text
+        token = r.json()["token"]
+        r = _v10_secret_request(client, "POST", "/api/auth/password", token,
+                                json={"current_password": "Bob@123456",
+                                      "new_password": "Bob@NewPass99"})
+        assert r.status_code == 200, r.text
+        _v13_seed_accounts()
+        r = _v13_login(client, "bob", "Bob@123456")
+        assert r.status_code == 401
+        assert r.json()["error"]["code"] == "INVALID_CREDENTIALS"
+        r = _v13_login(client, "bob", "Bob@NewPass99")
+        assert r.status_code == 200, r.text
+        # 还原 bob 口令，避免影响后续用例
+        token = r.json()["token"]
+        r = _v10_secret_request(client, "POST", "/api/auth/password", token,
+                                json={"current_password": "Bob@NewPass99",
+                                      "new_password": "Bob@123456"})
+        assert r.status_code == 200, r.text
+
+    def test_login_success_and_me_reflects_identity(self, client):
+        _v13_seed_accounts()
+        r = _v13_login(client, "admin", "Admin@123456")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["token"].startswith("dmc_ak_")
+        assert body["user_key"] == "u:admin"
+        assert body["is_admin"] is True
+        assert body["auth_mode"] == "demo"
+        assert body["expires_at"]  # 会话密钥带过期时间
+        # 会话令牌可用于 /api/auth/me（demo 模式渐进增强：真实身份）
+        r = _v10_secret_request(client, "GET", "/api/auth/me", body["token"])
+        assert r.status_code == 200, r.text
+        me = r.json()
+        assert me["user_key"] == "u:admin"
+        assert me["is_admin"] is True
+        assert me["has_password"] is True
+
+    def test_login_bare_name_and_full_key_equivalent(self, client):
+        _v13_seed_accounts()
+        r1 = _v13_login(client, "alice", "Alice@123456")
+        r2 = _v13_login(client, "u:alice", "Alice@123456")
+        assert r1.status_code == r2.status_code == 200
+        assert r1.json()["user_key"] == r2.json()["user_key"] == "u:alice"
+
+    def test_login_wrong_password_401(self, client):
+        _v13_seed_accounts()
+        r = _v13_login(client, "admin", "wrong-password")
+        assert r.status_code == 401
+        assert r.json()["error"]["code"] == "INVALID_CREDENTIALS"
+
+    def test_login_unknown_user_401_uniform(self, client):
+        _v13_seed_accounts()
+        r = _v13_login(client, "nosuchuser", "whatever1")
+        assert r.status_code == 401
+        assert r.json()["error"]["code"] == "INVALID_CREDENTIALS"
+
+    def test_login_disabled_user_401(self, client):
+        _v13_seed_accounts()
+        from backend.app.db import SessionLocal
+
+        with SessionLocal() as db:
+            user = db.scalar(
+                select(models_mod.User).where(
+                    models_mod.User.user_key == "u:carol"
+                )
+            )
+            user.status = "disabled"
+            db.commit()
+        try:
+            r = _v13_login(client, "carol", "Carol@123456")
+            assert r.status_code == 401
+            assert r.json()["error"]["code"] == "INVALID_CREDENTIALS"
+        finally:
+            with SessionLocal() as db:
+                user = db.scalar(
+                    select(models_mod.User).where(
+                        models_mod.User.user_key == "u:carol"
+                    )
+                )
+                user.status = "active"
+                db.commit()
+
+    def test_login_works_in_api_key_mode(self, client, monkeypatch):
+        _v13_seed_accounts()
+        _v10_switch(monkeypatch)
+        # 登录端点免认证（豁免路径），api_key 模式下同样可换取会话令牌
+        r = _v13_login(client, "admin", "Admin@123456")
+        assert r.status_code == 200, r.text
+        token = r.json()["token"]
+        r = _v10_secret_request(client, "GET", "/api/auth/me", token)
+        assert r.status_code == 200, r.text
+        assert r.json()["user_key"] == "u:admin"
+        # api_key 模式匿名请求仍然 401（语义未变）
+        r = client.get("/api/auth/me")
+        assert r.status_code == 401
+
+    def test_demo_anonymous_still_demo_admin(self, client):
+        # V0.9.2 兼容：demo 模式无令牌 → 演示管理员（E2E/既有行为不变）
+        r = client.get("/api/auth/me")
+        assert r.status_code == 200
+        me = r.json()
+        assert me["user_key"] == "u:demo.admin"
+        assert me["is_admin"] is True
+
+    def test_demo_invalid_token_not_silent_fallback(self, client):
+        # demo 模式携带无效令牌必须 401（不静默回落演示管理员：
+        # 否则被吊销的会话会被放大为管理员权限）。此处为格式合法但
+        # 密钥不存在的令牌（API_KEY_INVALID 路径）。
+        r = client.get("/api/auth/me", headers={
+            "Authorization": "Bearer dmc_ak_0123456789abcdef012345_nope"
+        })
+        assert r.status_code == 401
+        assert r.json()["error"]["code"] == "API_KEY_INVALID"
+
+    def test_demo_rbac_enforced_for_logged_in_viewer(self, client):
+        _v13_seed_accounts()
+        p = create_project(client, "PRJ_V13AUTH", "V13 权限演示项目")
+        # 补播种使演示账号成为该项目成员（模拟一次重启）
+        _v13_seed_accounts()
+        carol = _v13_token(client, "carol")
+        # viewer：可读
+        r = _v10_secret_request(
+            client, "GET", f"/api/projects/{p['id']}/models", carol)
+        assert r.status_code == 200, r.text
+        # viewer：不可写（editor 起）
+        r = _v10_secret_request(
+            client, "POST", f"/api/projects/{p['id']}/models", carol,
+            json={
+                "model_key": "dwd_v13_denied", "name": "越权创建",
+                "layer": "DWD", "model_type": "TABLE",
+                "target_engine": "postgresql", "fields": good_fields(),
+            })
+        assert r.status_code == 403
+        assert r.json()["error"]["code"] == "PROJECT_ROLE_INSUFFICIENT"
+        # editor（bob）：可写
+        bob = _v13_token(client, "bob")
+        r = _v10_secret_request(
+            client, "POST", f"/api/projects/{p['id']}/models", bob,
+            json={
+                "model_key": "dwd_v13_ok", "name": "授权创建",
+                "layer": "DWD", "model_type": "TABLE",
+                "target_engine": "postgresql", "fields": good_fields(),
+            })
+        assert r.status_code == 201, r.text
+        # 匿名（无令牌）仍是演示放行
+        r = api(client, "POST", f"/api/projects/{p['id']}/models", json={
+            "model_key": "dwd_v13_anon", "name": "匿名创建",
+            "layer": "DWD", "model_type": "TABLE",
+            "target_engine": "postgresql", "fields": good_fields(),
+        })
+        assert r.status_code == 201, r.text
+
+    def test_demo_admin_capabilities_via_token(self, client):
+        _v13_seed_accounts()
+        token = _v13_token(client, "admin")
+        # 平台管理员经令牌访问用户管理（require_admin 按真实 is_admin 放行）
+        r = _v10_secret_request(client, "GET", "/api/users", token)
+        assert r.status_code == 200, r.text
+        keys = [u["user_key"] for u in r.json()]
+        assert "u:admin" in keys
+        # 非 admin（bob）访问用户管理 → 403 ADMIN_REQUIRED
+        bob = _v13_token(client, "bob")
+        r = _v10_secret_request(client, "GET", "/api/users", bob)
+        assert r.status_code == 403
+        assert r.json()["error"]["code"] == "ADMIN_REQUIRED"
+
+    def test_logout_revokes_session_token(self, client):
+        _v13_seed_accounts()
+        token = _v13_token(client, "alice")
+        r = _v10_secret_request(client, "POST", "/api/auth/logout", token)
+        assert r.status_code == 200, r.text
+        assert r.json()["revoked"] is True
+        # 吊销即时生效（不等缓存 TTL）
+        r = _v10_secret_request(client, "GET", "/api/auth/me", token)
+        assert r.status_code == 401
+        assert r.json()["error"]["code"] == "API_KEY_REVOKED"
+
+    def test_logout_keeps_long_lived_api_key(self, client):
+        _v13_seed_accounts()
+        token = _v13_token(client, "alice")
+        r = _v10_secret_request(client, "POST", "/api/auth/api-keys", token,
+                                json={"name": "alice-long-key"})
+        assert r.status_code == 201, r.text
+        long_secret = r.json()["secret"]
+        r = _v10_secret_request(client, "POST", "/api/auth/logout", token)
+        assert r.json()["revoked"] is True
+        # 长期密钥不受登出影响
+        r = _v10_secret_request(client, "GET", "/api/auth/me", long_secret)
+        assert r.status_code == 200, r.text
+        assert r.json()["user_key"] == "u:alice"
+
+    def test_logout_without_token_is_safe(self, client):
+        r = client.post("/api/auth/logout")
+        assert r.status_code == 200
+        assert r.json()["revoked"] is False
+
+    def test_change_password_guards(self, client):
+        _v13_seed_accounts()
+        token = _v13_token(client, "carol")
+        # 当前密码错误
+        r = _v10_secret_request(client, "POST", "/api/auth/password", token,
+                                json={"current_password": "nope",
+                                      "new_password": "Carol@NewPass1"})
+        assert r.status_code == 401
+        assert r.json()["error"]["code"] == "INVALID_CREDENTIALS"
+        # 新密码过短（schema min_length=8 先行拦截；端点层
+        # PASSWORD_TOO_SHORT 为二次防线，两者均为 422）
+        r = _v10_secret_request(client, "POST", "/api/auth/password", token,
+                                json={"current_password": "Carol@123456",
+                                      "new_password": "short"})
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] in (
+            "PASSWORD_TOO_SHORT", "REQUEST_VALIDATION_FAILED"
+        )
+        # 新密码与当前相同
+        r = _v10_secret_request(client, "POST", "/api/auth/password", token,
+                                json={"current_password": "Carol@123456",
+                                      "new_password": "Carol@123456"})
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "PASSWORD_UNCHANGED"
+        # 正常修改后旧密码失效、新密码可登录
+        r = _v10_secret_request(client, "POST", "/api/auth/password", token,
+                                json={"current_password": "Carol@123456",
+                                      "new_password": "Carol@NewPass1"})
+        assert r.status_code == 200, r.text
+        assert _v13_login(client, "carol", "Carol@123456").status_code == 401
+        r = _v13_login(client, "carol", "Carol@NewPass1")
+        assert r.status_code == 200, r.text
+        # 还原 carol 口令，避免影响后续用例
+        token = r.json()["token"]
+        r = _v10_secret_request(client, "POST", "/api/auth/password", token,
+                                json={"current_password": "Carol@NewPass1",
+                                      "new_password": "Carol@123456"})
+        assert r.status_code == 200, r.text
+
+    def test_password_hash_not_returned(self, client):
+        _v13_seed_accounts()
+        token = _v13_token(client, "admin")
+        r = _v10_secret_request(client, "GET", "/api/auth/me", token)
+        body = r.text
+        assert "password_hash" not in body
+        assert "pbkdf2" not in body
+        r = _v10_secret_request(client, "GET", "/api/users", token)
+        assert "password_hash" not in r.text
+
+
+# ---------------------------------------------------------------- V1.3 业务总线矩阵
+
+
+def _bm_relate(c: TestClient, source_id: int, target_id: int,
+               rel_type: str = "joins_to", **extra) -> dict:
+    """建立 model_relationships（字段对取自 good_fields 的 order_id）。"""
+    body = {
+        "target_model_id": target_id, "relationship_type": rel_type,
+        "source_fields": ["order_id"], "target_fields": ["order_id"],
+    }
+    body.update(extra)
+    r = api(c, "POST", f"/api/models/{source_id}/relationships", json=body)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _bm_project(client: TestClient, key: str = "PRJ_BM") -> dict:
+    """最小总线矩阵 fixture：2 域 / 2 维 / 3 过程 / 1 未挂载过程。
+
+    边（4 条，其中 1 条为维度侧发起，验证方向归一化）：
+      dwd_bm_order → dim_bm_user（A 域过程 × B 域维度，跨域）
+      dwd_bm_order → dim_bm_date（A 域过程 × A 域维度）
+      dwd_bm_pay   → dim_bm_date（B 域过程 × A 域维度，跨域）
+      dim_bm_user  → dwd_bm_pay（维度侧发起 → 归一化为 B 域过程 × B 域维度）
+    另含 ODS / ADS 模型各一（ADS 也连了维度，验证非过程层不计入矩阵）。
+    """
+    p = create_project(client, key)
+    area_a = create_subject_area(client, p["id"], key + "_A")
+    area_b = create_subject_area(client, p["id"], key + "_B")
+    dim_user = create_model(client, p["id"], "dim_bm_user", layer="DIM",
+                            subject_area_id=area_b["id"], name="用户维表")
+    dim_date = create_model(client, p["id"], "dim_bm_date", layer="DIM",
+                            subject_area_id=area_a["id"], name="日期维表")
+    proc_1 = create_model(client, p["id"], "dwd_bm_order", layer="DWD",
+                          subject_area_id=area_a["id"], name="订单明细")
+    proc_2 = create_model(client, p["id"], "dws_bm_gmv", layer="DWS",
+                          subject_area_id=area_a["id"], name="GMV 汇总")
+    proc_3 = create_model(client, p["id"], "dwd_bm_pay", layer="DWD",
+                          subject_area_id=area_b["id"], name="支付明细")
+    ods = create_model(client, p["id"], "ods_bm_raw", layer="ODS",
+                       subject_area_id=area_a["id"], name="原始订单")
+    ads = create_model(client, p["id"], "ads_bm_report", layer="ADS",
+                       subject_area_id=area_a["id"], name="经营报表")
+    _bm_relate(client, proc_1["id"], dim_user["id"], cardinality="many_to_one",
+               description="订单关联用户")
+    _bm_relate(client, proc_1["id"], dim_date["id"])
+    _bm_relate(client, proc_3["id"], dim_date["id"])
+    _bm_relate(client, dim_user["id"], proc_3["id"])
+    _bm_relate(client, ads["id"], dim_user["id"])  # ADS → DIM 不计入矩阵
+    return {
+        "project": p, "area_a": area_a, "area_b": area_b,
+        "dim_user": dim_user, "dim_date": dim_date,
+        "proc_1": proc_1, "proc_2": proc_2, "proc_3": proc_3,
+        "ods": ods, "ads": ads,
+    }
+
+
+class TestBusMatrix:
+    """V1.3 业务总线矩阵：Kimball 过程 × 维度矩阵（总览 + 域内下钻）。"""
+
+    def test_overview_heatmap_and_summary(self, client):
+        fx = _bm_project(client, "PRJ_BM_OV")
+        pid = fx["project"]["id"]
+        r = client.get(f"/api/projects/{pid}/bus-matrix")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["mode"] == "overview"
+        # 列 = 全项目 DIM（按 model_key 排序），ODS/ADS 不出现在过程中
+        assert [x["model_key"] for x in d["dimensions"]] == [
+            "dim_bm_date", "dim_bm_user"]
+        assert d["summary"]["process_total"] == 3
+        assert d["summary"]["dimension_total"] == 2
+        # 行 = 主题域（按 id）：A 域 2 过程、B 域 1 过程
+        rows = {row["subject_area"]["area_key"]: row for row in d["matrix"]}
+        assert set(rows) == {"PRJ_BM_OV_A", "PRJ_BM_OV_B"}
+        assert rows["PRJ_BM_OV_A"]["process_count"] == 2
+        assert rows["PRJ_BM_OV_B"]["process_count"] == 1
+        # 单元格 = 域内引用该维度的过程数（维度侧发起的边归一化到过程侧）
+        assert rows["PRJ_BM_OV_A"]["counts"] == [1, 1]   # date / user
+        assert rows["PRJ_BM_OV_B"]["counts"] == [1, 1]   # date / user
+        # 汇总：4 个映射单元格 / 4 条直连关系（ADS→DIM 不计）
+        assert d["summary"]["mapped_cells"] == 4
+        assert d["summary"]["relation_total"] == 4
+        # 两个维度均被两域共用 → 一致性维度
+        shared = {x["model_key"]: x for x in d["summary"]["shared_dimensions"]}
+        assert set(shared) == {"dim_bm_date", "dim_bm_user"}
+        assert shared["dim_bm_user"]["area_count"] == 2
+        assert shared["dim_bm_user"]["process_count"] == 2
+        assert d["summary"]["orphan_dimensions"] == []
+        # dws_bm_gmv 未挂载任何维度
+        assert [x["model_key"] for x in d["summary"]["unmapped_processes"]] == [
+            "dws_bm_gmv"]
+
+    def test_area_mode_cells_and_field_pairs(self, client):
+        fx = _bm_project(client, "PRJ_BM_AREA")
+        pid = fx["project"]["id"]
+        r = client.get(
+            f"/api/projects/{pid}/bus-matrix",
+            params={"subject_area_id": fx["area_a"]["id"]})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["mode"] == "area"
+        assert d["subject_area"]["area_key"] == "PRJ_BM_AREA_A"
+        # 过程行带维度覆盖数
+        procs = {p["model_key"]: p for p in d["processes"]}
+        assert set(procs) == {"dwd_bm_order", "dws_bm_gmv"}
+        assert procs["dwd_bm_order"]["dimension_count"] == 2
+        assert procs["dws_bm_gmv"]["dimension_count"] == 0
+        # 单元格：2 个（order × date / order × user）
+        assert len(d["cells"]) == 2
+        cell = next(c for c in d["cells"]
+                    if c["dimension_id"] == fx["dim_user"]["id"])
+        assert cell["process_id"] == fx["proc_1"]["id"]
+        assert cell["edge_count"] == 1
+        assert cell["relationship_types"] == ["joins_to"]
+        pair = cell["field_pairs"][0]
+        assert pair["source_fields"] == ["order_id"]
+        assert pair["target_fields"] == ["order_id"]
+        assert pair["cardinality"] == "many_to_one"
+        assert pair["direction"] == "process_to_dimension"
+        assert pair["description"] == "订单关联用户"
+        # 维度复用：dim_user 本域 1 / 外域 1（一致性维度）
+        reuse = {x["model_key"]: x for x in d["dimension_reuse"]}
+        assert reuse["dim_bm_user"]["in_area_process_count"] == 1
+        assert reuse["dim_bm_user"]["out_of_area_process_count"] == 1
+        assert reuse["dim_bm_user"]["is_shared"] is True
+        # 汇总：跨域引用 1（order → B 域的 dim_user）
+        s = d["summary"]
+        assert s["process_total"] == 2
+        assert s["mapped_cells"] == 2
+        assert s["relation_total"] == 2
+        assert s["cross_area_relations"] == 1
+        assert s["consistency_dimensions"] == 2
+        assert s["orphan_dimensions"] == 0
+        assert [x["model_key"] for x in s["unmapped_processes"]] == [
+            "dws_bm_gmv"]
+
+    def test_area_mode_dimension_side_direction(self, client):
+        """维度侧发起的关系归一化为「过程 × 维度」且方向可辨。"""
+        fx = _bm_project(client, "PRJ_BM_DIR")
+        pid = fx["project"]["id"]
+        r = client.get(
+            f"/api/projects/{pid}/bus-matrix",
+            params={"subject_area_id": fx["area_b"]["id"]})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        cell = next(c for c in d["cells"]
+                    if c["process_id"] == fx["proc_3"]["id"]
+                    and c["dimension_id"] == fx["dim_user"]["id"])
+        assert cell["edge_count"] == 1
+        assert cell["field_pairs"][0]["direction"] == "dimension_to_process"
+        # B 域视角：dim_date 属 A 域（跨域引用 1），dim_user 属 B 域（本域）
+        assert d["summary"]["cross_area_relations"] == 1
+
+    def test_unassigned_process_row_in_overview(self, client):
+        """未归属主题域的过程以「未归属」行出现在总览。"""
+        p = create_project(client, "PRJ_BM_UNASSIGNED")
+        dim = create_model(client, p["id"], "dim_bm_orphan", layer="DIM",
+                           name="孤岛维表")
+        create_model(client, p["id"], "dwd_bm_float", layer="DWD",
+                     name="浮动过程")  # 无主题域、无维度
+        r = client.get(f"/api/projects/{p['id']}/bus-matrix")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        # 无主题域 → 只有「未归属」行（dim_bm_orphan 无过程引用 → 计数 0）
+        assert len(d["matrix"]) == 1
+        assert d["matrix"][0]["unassigned"] is True
+        assert d["matrix"][0]["subject_area"] is None
+        assert d["matrix"][0]["process_count"] == 1
+        assert d["matrix"][0]["counts"] == [0]
+        assert d["summary"]["process_total"] == 1
+        assert d["summary"]["unmapped_processes"][0]["model_key"] == \
+            "dwd_bm_float"
+        assert d["summary"]["orphan_dimensions"][0]["model_key"] == \
+            "dim_bm_orphan"
+        assert d["summary"]["shared_dimensions"] == []
+
+    def test_empty_project(self, client):
+        p = create_project(client, "PRJ_BM_EMPTY")
+        r = client.get(f"/api/projects/{p['id']}/bus-matrix")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["mode"] == "overview"
+        assert d["dimensions"] == []
+        assert d["matrix"] == []
+        assert d["summary"]["process_total"] == 0
+        assert d["summary"]["relation_total"] == 0
+
+    def test_guards_404(self, client):
+        fx = _bm_project(client, "PRJ_BM_404")
+        pid = fx["project"]["id"]
+        r = client.get("/api/projects/999999/bus-matrix")
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
+        r = client.get(f"/api/projects/{pid}/bus-matrix",
+                       params={"subject_area_id": 999999})
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "SUBJECT_AREA_NOT_FOUND"
+        # 其他项目的主题域 → 404（项目边界）
+        other = create_project(client, "PRJ_BM_404_B")
+        r = client.get(f"/api/projects/{pid}/bus-matrix",
+                       params={"subject_area_id": fx["area_a"]["id"]})
+        assert r.status_code == 200
+        r = client.get(f"/api/projects/{other['id']}/bus-matrix",
+                       params={"subject_area_id": fx["area_a"]["id"]})
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "SUBJECT_AREA_NOT_FOUND"
+
+    def test_viewer_role_can_read(self, client):
+        """viewer 可读总线矩阵（demo 匿名同样放行，保持既有兼容）。"""
+        fx = _bm_project(client, "PRJ_BM_RBAC")
+        pid = fx["project"]["id"]
+        # demo 匿名（无令牌）
+        r = client.get(f"/api/projects/{pid}/bus-matrix")
+        assert r.status_code == 200, r.text
+        # viewer（carol）：补播种成为项目成员后可读
+        _v13_seed_accounts()
+        carol = _v13_token(client, "carol")
+        r = _v10_secret_request(client, "GET",
+                                f"/api/projects/{pid}/bus-matrix", carol)
+        assert r.status_code == 200, r.text
+        assert r.json()["mode"] == "overview"

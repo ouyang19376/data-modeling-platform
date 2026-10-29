@@ -1,12 +1,20 @@
-"""数据建模中心 V1.0 — 认证与项目级授权（M1/M2）。
+"""数据建模中心 V1.0 — 认证与项目级授权（M1/M2），V1.3 密码登录。
 
 身份模型（设计文档第 3 章）：
 - ``AUTH_MODE=demo``（默认）：``X-Actor`` 演示身份，所有授权检查短路，
   行为与 V0.9.2 完全一致；启动时幂等播种演示管理员与项目 owner 成员。
+  V1.3 起 demo 模式**渐进增强**：请求携带有效 Bearer 令牌时按真实身份
+  解析并强制执行 RBAC（匿名仍回落演示管理员），使登录模块与角色梯度
+  演示可在本地开发环境完整体验；无效/过期令牌照常 401（不静默回落，
+  避免吊销会话被误放大为管理员权限）。
 - ``AUTH_MODE=api_key``：``Authorization: Bearer dmc_<key_id>_<secret>``；
   服务端只存 ``SHA-256(secret)`` 十六进制摘要，``hmac.compare_digest``
   常量时间比较；进程内密钥缓存 TTL 60s，吊销/禁用即时失效（主动
   invalidate），``last_used_at`` 节流（≥60s）落库。
+- V1.3 密码登录：``POST /api/auth/login`` 账号密码换会话密钥（复用
+  api_keys 表，name=``session:web``，expires 按 AUTH_SESSION_HOURS）；
+  口令 PBKDF2-HMAC-SHA256 60 万次迭代哈希，不明文存储；登录失败统一
+  401 INVALID_CREDENTIALS（不泄露主体存在性）。
 - 授权：项目三角色 owner/editor/viewer（viewer < editor < owner）；
   平台 admin（``users.is_admin``）旁路全部项目检查。
 
@@ -38,6 +46,19 @@ from .events import record_audit
 DEMO_ADMIN_KEY = "u:demo.admin"
 DEMO_ADMIN_NAME = "演示管理员"
 
+# V1.3 密码登录：PBKDF2-HMAC-SHA256（OWASP 2023 推荐迭代次数），
+# 哈希串格式 pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>（Django
+# 风格，迭代次数内嵌，未来可平滑升级算法而不需重置全部口令）。
+_PBKDF2_ALGORITHM = "pbkdf2_sha256"
+_PBKDF2_ITERATIONS = 600_000
+_PBKDF2_SALT_BYTES = 16
+
+# 登录签发的会话密钥统一名前缀（logout 仅吊销会话密钥，不动长期密钥）。
+SESSION_KEY_NAME = "session:web"
+
+# 密码最小长度（修改密码端点强制；种子账号默认口令均满足）。
+PASSWORD_MIN_LENGTH = 8
+
 # key_id 固定结构：ak_ 前缀 + 10-40 位字母数字（不含下划线）。
 # 令牌整体匹配：dmc_<key_id>_<secret>。secret 为 base64url（43 字符，
 # 可能含 -/_），不能简单用 partition("_") 切分（key_id 的 ak_ 前缀与
@@ -49,12 +70,13 @@ _USER_KEY_PATTERN = r"^[a-z]+:[A-Za-z0-9_.-]{1,64}$"
 
 ROLE_LEVEL = {"viewer": 1, "editor": 2, "owner": 3}
 
-# api_key 模式下免认证路径：探活与一次性引导（引导自身发钥匙）。
+# api_key 模式下免认证路径：探活、一次性引导与密码登录（登录自身发钥匙）。
 _AUTH_EXEMPT_PATHS = {
     "/api/health/live",
     "/api/health/ready",
     "/api/health",
     "/api/auth/bootstrap",
+    "/api/auth/login",
 }
 
 
@@ -120,6 +142,101 @@ def _parse_bearer(header: str | None) -> tuple[str, str] | None:
     if m is None:
         return None
     return m.group(1), m.group(2)
+
+
+# ---------------------------------------------------------------- 密码材料（V1.3）
+
+
+def hash_password(password: str) -> str:
+    """PBKDF2-HMAC-SHA256 哈希；返回 pbkdf2_sha256$iterations$salt$hash。"""
+    salt = pysecrets.token_bytes(_PBKDF2_SALT_BYTES)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS
+    )
+    return (
+        f"{_PBKDF2_ALGORITHM}${_PBKDF2_ITERATIONS}"
+        f"${salt.hex()}${digest.hex()}"
+    )
+
+
+def verify_password(password: str, stored: str | None) -> bool:
+    """常量时间校验口令；stored 为 None（未设置密码）时恒假。"""
+    if not stored:
+        return False
+    try:
+        algorithm, iterations, salt_hex, hash_hex = stored.split("$", 3)
+        if algorithm != _PBKDF2_ALGORITHM:
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"),
+            bytes.fromhex(salt_hex), int(iterations),
+        )
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(digest.hex(), hash_hex)
+
+
+def _login_candidates(login: str) -> list[str]:
+    """登录名 → user_key 候选：原样优先，无前缀时补 u: 前缀。"""
+    login = login.strip()
+    if not login:
+        return []
+    candidates = [login]
+    if ":" not in login:
+        candidates.append(f"u:{login}")
+    return candidates
+
+
+def login_with_password(
+    db: Session, login: str, password: str
+) -> tuple[models.User, models.ApiKey, str]:
+    """账号密码登录：成功返回 (user, session_key, secret)。
+
+    失败一律 401 INVALID_CREDENTIALS（用户不存在/未设密码/口令错误/
+    主体禁用同一话术，不泄露主体存在性）；登录成功签发会话密钥
+    （expires_at 按 AUTH_SESSION_HOURS，0 表示不过期）。
+    """
+    user = db.scalar(
+        select(models.User).where(
+            models.User.user_key.in_(_login_candidates(login))
+        )
+    )
+    if (
+        user is None
+        or user.status != "active"
+        or not verify_password(password, user.password_hash)
+    ):
+        raise ApiError(401, "INVALID_CREDENTIALS", "用户名或密码错误")
+    hours = settings.auth_session_hours
+    key, secret = create_api_key(
+        db, user, SESSION_KEY_NAME,
+        expires_in_days=None if hours == 0 else hours / 24,
+        created_by=user.user_key,
+    )
+    return user, key, secret
+
+
+def change_password(
+    db: Session, user: models.User, current: str, new: str
+) -> None:
+    """修改本人密码：需校验当前口令；新口令过短或与旧口令相同则 422。"""
+    if len(new) < PASSWORD_MIN_LENGTH:
+        raise ApiError(
+            422, "PASSWORD_TOO_SHORT",
+            f"新密码长度至少 {PASSWORD_MIN_LENGTH} 位",
+        )
+    if not verify_password(current, user.password_hash):
+        raise ApiError(401, "INVALID_CREDENTIALS", "当前密码错误")
+    if verify_password(new, user.password_hash):
+        raise ApiError(422, "PASSWORD_UNCHANGED", "新密码不能与当前密码相同")
+    user.password_hash = hash_password(new)
+    db.flush()
+
+
+def key_id_of_token(header: str | None) -> str | None:
+    """从 Authorization 头提取 key_id（不校验 secret；logout 定位会话用）。"""
+    parsed = _parse_bearer(header)
+    return parsed[0] if parsed else None
 
 
 # ---------------------------------------------------------------- 密钥缓存
@@ -346,17 +463,22 @@ def _check_project_role(
 
 
 def require_project_role(minimum: str):
-    """项目级授权依赖工厂：GET 用 viewer，写操作用 editor，成员管理用 owner。"""
+    """项目级授权依赖工厂：GET 用 viewer，写操作用 editor，成员管理用 owner。
+
+    V1.3：demo 模式渐进增强——请求携带有效 Bearer 令牌（中间件已解析
+    并注入 request.state.identity）时按真实身份强制执行；匿名请求
+    （无令牌）保持 V0.9.2 兼容的演示放行。
+    """
 
     def dep(
         project_id: int,
         request: Request,
         db: Session = Depends(get_db),
     ) -> None:
-        if settings.auth_mode == "demo":
-            return  # V0.9.2 兼容：演示模式无授权
         identity = _identity_of(request)
         if identity is None:
+            if settings.auth_mode == "demo":
+                return  # 匿名演示：V0.9.2 兼容
             raise ApiError(401, "AUTH_REQUIRED", "缺少身份信息")
         _check_project_role(db, project_id, minimum, identity)
 
@@ -364,17 +486,17 @@ def require_project_role(minimum: str):
 
 
 def require_model_role(minimum: str):
-    """模型级授权依赖工厂：先按 model_id 解析项目再校验角色。"""
+    """模型级授权依赖工厂：先按 model_id 解析项目再校验角色（demo 语义同项目级）。"""
 
     def dep(
         model_id: int,
         request: Request,
         db: Session = Depends(get_db),
     ) -> None:
-        if settings.auth_mode == "demo":
-            return
         identity = _identity_of(request)
         if identity is None:
+            if settings.auth_mode == "demo":
+                return
             raise ApiError(401, "AUTH_REQUIRED", "缺少身份信息")
         model = db.get(models.DataModel, model_id)
         if model is None:
@@ -385,17 +507,17 @@ def require_model_role(minimum: str):
 
 
 def require_requirement_role(minimum: str):
-    """需求级授权依赖工厂：先按 requirement_id 解析项目再校验角色。"""
+    """需求级授权依赖工厂：先按 requirement_id 解析项目再校验角色（demo 语义同项目级）。"""
 
     def dep(
         requirement_id: int,
         request: Request,
         db: Session = Depends(get_db),
     ) -> None:
-        if settings.auth_mode == "demo":
-            return
         identity = _identity_of(request)
         if identity is None:
+            if settings.auth_mode == "demo":
+                return
             raise ApiError(401, "AUTH_REQUIRED", "缺少身份信息")
         requirement = db.get(models.BusinessRequirement, requirement_id)
         if requirement is None:
@@ -418,20 +540,23 @@ def require_authenticated(request: Request) -> Identity:
 
 
 def require_admin(request: Request) -> Identity:
-    """平台级授权依赖：仅 admin（demo 模式短路，与项目级依赖一致）。
+    """平台级授权依赖：仅 admin（demo 匿名回落合成演示管理员，V1.3）。
 
     /api/users 用户管理族使用；非 admin → 403 ADMIN_REQUIRED。
-    demo 模式无 request.state.identity（中间件直接放行），返回合成的
-    演示管理员身份（user_id=0 不会命中任何真实行的自操作防护）。
+    demo 模式：无令牌时返回合成的演示管理员身份（user_id=0 不会命中
+    任何真实行的自操作防护）；携带有效令牌时按真实 is_admin 校验
+    （V1.3 渐进增强，与项目级依赖同一语义）。
     """
-    if settings.auth_mode == "demo":
+    identity = _identity_of(request)
+    if identity is None:
+        if settings.auth_mode != "demo":
+            raise ApiError(401, "AUTH_REQUIRED", "缺少身份信息")
         return Identity(
             user_id=0,
             user_key=DEMO_ADMIN_KEY,
             display_name=DEMO_ADMIN_NAME,
             is_admin=True,
         )
-    identity = require_authenticated(request)
     if not identity.is_admin:
         raise ApiError(
             403, "ADMIN_REQUIRED",
@@ -526,10 +651,13 @@ def create_api_key(
     db: Session,
     user: models.User,
     name: str,
-    expires_in_days: int | None,
+    expires_in_days: int | float | None,
     created_by: str,
 ) -> tuple[models.ApiKey, str]:
-    """创建密钥；返回 (row, secret)。secret 仅此函数调用方可见一次。"""
+    """创建密钥；返回 (row, secret)。secret 仅此函数调用方可见一次。
+
+    expires_in_days 支持小数（V1.3 登录会话按小时换算，如 12h → 0.5 天）。
+    """
     key_id, secret, key_hash = generate_key_material()
     expires_at = (
         datetime.now(timezone.utc) + timedelta(days=expires_in_days)
@@ -602,6 +730,60 @@ def ensure_demo_admin(db: Session) -> models.User:
             ))
     db.flush()
     return user
+
+
+# V1.3 demo 模式启动播种的账号矩阵（README「演示账号」表同步维护）：
+# 平台管理员 1 个 + 项目角色梯度 3 个（owner/editor/viewer），供登录模块
+# 与 RBAC 差异演示。口令为演示环境默认值，仅在 demo 模式播种；
+# api_key 模式经 bootstrap 引导创建管理员，不播种任何默认口令。
+DEMO_ACCOUNTS: list[dict] = [
+    {"user_key": "u:admin", "display_name": "平台管理员",
+     "password": "Admin@123456", "is_admin": True, "role": "owner"},
+    {"user_key": "u:alice", "display_name": "Alice（项目负责人）",
+     "password": "Alice@123456", "is_admin": False, "role": "owner"},
+    {"user_key": "u:bob", "display_name": "Bob（建模编辑）",
+     "password": "Bob@123456", "is_admin": False, "role": "editor"},
+    {"user_key": "u:carol", "display_name": "Carol（只读审计）",
+     "password": "Carol@123456", "is_admin": False, "role": "viewer"},
+]
+
+
+def ensure_demo_accounts(db: Session) -> list[models.User]:
+    """demo 模式幂等播种演示账号矩阵（V1.3 登录模块）。
+
+    - 账号不存在 → 创建并设置默认口令（password_hash）；
+    - 已存在且无密码 → 补设默认口令（兼容先经 X-Actor/代建开通的主体）；
+    - 已存在且已有密码 → 原样保留（尊重用户改密，重启不重置；
+      禁用状态同样不覆盖）。
+    - 每个账号按 role 登记为全部既有项目的成员（与 ensure_demo_admin
+      同边界）；is_admin 账号按 owner 登记（平台旁路本就无视角色）。
+    只 flush 不 commit，由调用方在自身事务边界提交。
+    """
+    users: list[models.User] = []
+    for spec in DEMO_ACCOUNTS:
+        user, created = get_or_create_user(
+            db, spec["user_key"], spec["display_name"], kind="human",
+            is_admin=spec["is_admin"], created_by="system",
+        )
+        if created or not user.password_hash:
+            user.password_hash = hash_password(spec["password"])
+        for project in db.scalars(select(models.Project)):
+            exists = db.scalar(
+                select(models.ProjectMember.id).where(
+                    models.ProjectMember.project_id == project.id,
+                    models.ProjectMember.user_id == user.id,
+                )
+            )
+            if exists is None:
+                db.add(models.ProjectMember(
+                    project_id=project.id,
+                    user_id=user.id,
+                    role=spec["role"],
+                    created_by="system",
+                ))
+        users.append(user)
+    db.flush()
+    return users
 
 
 def upsert_project_member(
